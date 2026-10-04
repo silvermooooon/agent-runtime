@@ -124,12 +124,30 @@ class Models:
                 if model.api not in PARSERS:
                     raise ValueError(f"No provider adapter for API: {model.api}")
                 provider = self._providers.get(model.provider)
-                report = normalize_parameters(
-                    model,
-                    options,
-                    provider_policy=provider.parameter_policy if provider else None,
-                    context=context,
-                )
+                restored = options.get("_resume_parameters")
+                if restored:
+                    report = ParameterReport(
+                        parameters=deepcopy(restored["parameters"]),
+                        dropped=deepcopy(restored["dropped"]),
+                        adjusted=deepcopy(restored["adjusted"]),
+                    )
+                    options["timeout"] = restored["timeout"]
+                else:
+                    report = normalize_parameters(
+                        model,
+                        options,
+                        provider_policy=provider.parameter_policy if provider else None,
+                        context=context,
+                    )
+                session = options.get("_session")
+                if session and not restored:
+                    await session.commit(
+                        "provider_parameters",
+                        parameters=report.parameters,
+                        dropped=report.dropped,
+                        adjusted=report.adjusted,
+                        timeout=options.get("timeout", 120),
+                    )
                 if options.get("on_parameters"):
                     await maybe_await(options["on_parameters"](deepcopy(report), model))
                 payload = build_payload(model, context, report.parameters)

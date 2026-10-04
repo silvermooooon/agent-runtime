@@ -12,6 +12,7 @@ from .ai import Models, normalize_parameters
 from .config import ProviderConfig, RuntimeConfig
 from .event_stream import AssistantMessageEventStream, EventStream
 from .proxy import stream_proxy
+from .sessions import LocalSession, Session, SessionBusyError, SessionError, ToolRecoveryRequired
 from .stream_fn import set_default_stream_fn
 from .types import (
     AbortSignal,

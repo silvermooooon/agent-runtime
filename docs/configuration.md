@@ -51,3 +51,11 @@ agent = Agent(models=models, provider="tenant-a", model="deployment-name")
 自定义 provider 不会继承 `OPENAI_API_KEY`。通过 `get_api_key(provider)` 可在每次模型请求前刷新短期凭据。共享连接池可以显式传入 `httpx.AsyncClient`；该 client 由调用方关闭。未传入时，SDK 每次请求创建并关闭自己的 client。
 
 不自动加载 ChatGPT OAuth、系统凭据仓库或其他项目的 `.env`。API Key 字段不会出现在配置对象的默认 repr 中。
+
+## Session 存储位置
+
+`Agent()` 默认使用文件支持的 `LocalSession`，位于当前工作目录的 `.agent-runtime/sessions`。
+通过 `Agent(session=LocalSession(session_id="...", directory="/data/sessions"), ...)` 指定目录和身份。
+Session 不读取新的环境变量，存储路径由宿主显式配置；`directory=None` 为该组件内的纯内存模式。
+已存在的 Session 优先恢复其模型配置，API Key 和 transport headers 仍由当前进程重新注入。
+详见 [Session 生命周期与恢复](sessions.md)。

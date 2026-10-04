@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field, replace
+from uuid import uuid4
 
-from .agent_loop import run_agent_loop, run_agent_loop_continue
+from .agent_loop import run_agent_loop, run_agent_loop_continue, run_agent_loop_resume
 from .ai import Models
+from .sessions import LocalSession, SessionError, ToolRecoveryRequired
+from .sessions.base import restore_model, tool_records
 from .stream_fn import get_default_stream_fn
 from .transcript import current_system_message, system_prompt, tool_declaration
 from .types import (
@@ -59,6 +62,7 @@ class Agent:
         self,
         *,
         model: Model | str | None = None,
+        session=None,
         provider: str | None = None,
         api: str | None = None,
         base_url: str | None = None,
@@ -80,10 +84,17 @@ class Agent:
         finish_turn=None,
         prepare_request=None,
         prepare_next_turn=None,
-        steering_mode="one-at-a-time",
-        follow_up_mode="one-at-a-time",
-        tool_execution="parallel",
+        steering_mode=None,
+        follow_up_mode=None,
+        tool_execution=None,
     ):
+        self.session = session if session is not None else LocalSession()
+        restored = self.session.snapshot
+        tool_execution = tool_execution or restored["tool_execution"]
+        steering_mode = steering_mode or restored["queue_modes"]["steering"]
+        follow_up_mode = follow_up_mode or restored["queue_modes"]["follow_up"]
+        if model is None and restored["model"]:
+            model = self.session.restored_model()
         if not isinstance(model, Model):
             models = models or Models(config=config, env=env)
             model = models.get_model(provider, model, api=api, base_url=base_url)
@@ -99,7 +110,7 @@ class Agent:
         self.stream_function = stream_fn or (
             models.stream_simple if models else get_default_stream_fn()
         )
-        transcript = list(messages or [])
+        transcript = restored["messages"] if restored["model"] else list(messages or [])
         tools = list(tools or [])
         if (system_prompt or tools) and (not transcript or transcript[0]["role"] != "system"):
             transcript.insert(
@@ -111,7 +122,11 @@ class Agent:
                     "toolsAdded": [tool_declaration(t) for t in tools],
                 },
             )
-        self.parameters = {**(models.config.parameters if models else {}), **(parameters or {})}
+        self.parameters = {
+            **(models.config.parameters if models else {}),
+            **restored["options"],
+            **(parameters or {}),
+        }
         self.state = AgentState(
             model,
             thinking_level if thinking_level is not None else self.parameters.get("reasoning"),
@@ -130,10 +145,13 @@ class Agent:
         self.tool_execution = tool_execution
         self._steering = PendingMessageQueue(steering_mode)
         self._follow_up = PendingMessageQueue(follow_up_mode)
+        self._steering.messages = restored["steering"]
+        self._follow_up.messages = restored["follow_up"]
         self._listeners = []
         self.signal = None
         self._idle = asyncio.Event()
         self._idle.set()
+        self._session_revision = self.session.revision
 
     def subscribe(self, listener):
         """Listeners run in registration order and are awaited, including agent_end."""
@@ -147,17 +165,54 @@ class Agent:
         return unsubscribe
 
     def steer(self, message):
-        self._steering.messages.append(
-            user_message(message) if isinstance(message, str) else message
-        )
+        message = user_message(message) if isinstance(message, str) else dict(message)
+        message.setdefault("queueId", uuid4().hex)
+        self._steering.messages.append(message)
 
     def follow_up(self, message):
-        self._follow_up.messages.append(
-            user_message(message) if isinstance(message, str) else message
-        )
+        message = user_message(message) if isinstance(message, str) else dict(message)
+        message.setdefault("queueId", uuid4().hex)
+        self._follow_up.messages.append(message)
+
+    async def enqueue(self, message, *, follow_up=False):
+        """Durably accept queued input; synchronous steer/follow_up remain immediate RAM APIs."""
+        message = user_message(message) if isinstance(message, str) else dict(message)
+        message["queueId"] = uuid4().hex
+        own_writer = not self.state.is_streaming
+        if own_writer:
+            await self.session.acquire()
+        try:
+            if own_writer and self.session.revision != self._session_revision:
+                raise SessionError("Session changed in another writer; reopen Agent before enqueue")
+            await self.session.commit(
+                "input_queued", queue="follow_up" if follow_up else "steering", message=message
+            )
+            queue = self._follow_up if follow_up else self._steering
+            queue.messages.append(message)
+            self._session_revision = self.session.revision
+        finally:
+            if own_writer:
+                await self.session.release()
 
     def clear_steering_queue(self):
         self._steering.messages.clear()
+
+    async def clear_queued_inputs(self):
+        """Durably clear both pending queues; synchronous clear methods only change RAM."""
+        own_writer = not self.state.is_streaming
+        if own_writer:
+            await self.session.acquire()
+        try:
+            if own_writer and self.session.revision != self._session_revision:
+                raise SessionError(
+                    "Session changed in another writer; reopen Agent before clearing"
+                )
+            await self.session.commit("queues", steering=[], follow_up=[])
+            self.clear_all_queues()
+            self._session_revision = self.session.revision
+        finally:
+            if own_writer:
+                await self.session.release()
 
     def clear_follow_up_queue(self):
         self._follow_up.messages.clear()
@@ -181,6 +236,8 @@ class Agent:
 
     def reset(self):
         self._check_idle()
+        if self.session.resumable:
+            raise SessionError("Use await reset_session() to explicitly abandon unfinished work")
         baseline = current_system_message(self.state.messages)
         self.state.messages = [baseline] if baseline else []
         self.state.error_message = None
@@ -214,8 +271,48 @@ class Agent:
             raise ValueError("Cannot continue from message role: assistant")
         return await self._run(None)
 
-    async def _run(self, prompts, skip_initial_steering=False):
+    async def resume(self):
+        """Resume the durable pending model/tool/turn boundary, including assistant tool plans."""
         self._check_idle()
+        return await self._run(None, resume=True)
+
+    async def _run(self, prompts, skip_initial_steering=False, resume=False):
+        self._check_idle()
+        await self.session.acquire()
+        saved = self.session.snapshot
+        if not resume and self.session.revision != self._session_revision:
+            await self.session.release()
+            raise SessionError("Session changed in another writer; reopen Agent before new input")
+        if resume and not self.session.resumable:
+            await self.session.release()
+            raise SessionError("No unfinished session run to resume")
+        if not resume and self.session.resumable:
+            await self.session.release()
+            raise SessionError("Session has unfinished work; call resume() or reset_session()")
+        if resume:
+            missing = [
+                name
+                for name in saved["required_hooks"]
+                if getattr(self, name) is None or getattr(self, name) is default_convert_to_llm
+            ]
+            if missing:
+                await self.session.release()
+                raise SessionError(f"Re-inject required runtime hooks before resuming: {missing}")
+            if saved["phase"] == "model" and tool_records(self.state.tools) != saved["tools"]:
+                await self.session.release()
+                raise SessionError("Re-inject the original tools before resuming a model request")
+            self.state.messages = saved["messages"]
+            original = restore_model(saved["model"])
+            if (original.id, original.provider, original.api) != (
+                self.state.model.id,
+                self.state.model.provider,
+                self.state.model.api,
+            ):
+                await self.session.release()
+                raise SessionError("Resume requires the original provider, model and API")
+            self.state.model = replace(original, headers=self.state.model.headers)
+            self._steering.messages = saved["steering"]
+            self._follow_up.messages = saved["follow_up"]
         self.state.is_streaming = True
         self.state.error_message = None
         self.state.streaming_message = None
@@ -246,9 +343,19 @@ class Agent:
             prepare_request=self.prepare_request,
             prepare_next_turn=self.prepare_next_turn,
             tool_execution=self.tool_execution,
+            session=self.session,
+            queue_modes={"steering": self._steering.mode, "follow_up": self._follow_up.mode},
+            queue_state={
+                "steering": list(self._steering.messages),
+                "follow_up": list(self._follow_up.messages),
+            },
         )
         context = AgentContext(list(self.state.messages), list(self.state.tools))
         try:
+            if resume:
+                return await run_agent_loop_resume(
+                    context, config, self._process, self.signal, self.stream_function
+                )
             if prompts is None:
                 return await run_agent_loop_continue(
                     context, config, self._process, self.signal, self.stream_function
@@ -258,8 +365,28 @@ class Agent:
             )
         except asyncio.CancelledError:
             self.signal.abort()
+            if not self.session._failed and self.session.resumable:
+                await self.session.commit(
+                    "run_interrupted", status="interrupted", reason="Python task cancelled"
+                )
+            raise
+        except SessionError as error:
+            self.state.error_message = str(error)
+            if isinstance(error, ToolRecoveryRequired) and not self.session._failed:
+                await self.session.commit(
+                    "run_interrupted", status="waiting_recovery", reason=str(error)
+                )
             raise
         except Exception as error:
+            if isinstance(error, BaseExceptionGroup) and error.split(SessionError)[0]:
+                self.state.error_message = str(error)
+                raise SessionError("Session failed during parallel tool execution") from error
+            if self.session.resumable:
+                await self.session.commit(
+                    "run_interrupted",
+                    status="stopped" if self.signal.aborted else "failed",
+                    reason=str(error),
+                )
             message = assistant_message(
                 self.state.model,
                 stopReason="aborted" if self.signal.aborted else "error",
@@ -278,9 +405,26 @@ class Agent:
             self.state.streaming_message = None
             self.state.pending_tool_calls.clear()
             self.signal = None
+            await self.session.release()
+            self._session_revision = self.session.revision
             self._idle.set()
 
+    async def reset_session(self):
+        """Explicitly abandon pending work and append a reset; old audit records remain."""
+        self._check_idle()
+        await self.session.acquire()
+        try:
+            baseline = current_system_message(self.session.snapshot["messages"])
+            messages = [baseline] if baseline else []
+            await self.session.commit("history_reset", messages=messages)
+            self.reset()
+            self.state.messages = messages
+            self._session_revision = self.session.revision
+        finally:
+            await self.session.release()
+
     async def _process(self, event):
+        self.session.observe(event)
         kind = event["type"]
         if kind in ("message_start", "message_update"):
             self.state.streaming_message = event["message"]

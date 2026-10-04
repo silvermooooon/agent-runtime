@@ -46,6 +46,8 @@
 - 用 asyncio、httpx 和 jsonschema 替换 TS 的 Promise、厂商 SDK 和 TypeBox。
 - Python TaskGroup 在事件 sink 失败时取消并行兄弟任务；避免异常后遗留后台执行。工具外部副作用仍不因此撤销。
 - 增加 provider/model 参数策略、过滤报告、环境配置与默认 Responses 入口。
+- 增加基于 Session 继承接口的本地事件记录、直接保存边界和 resume 入口；内存瞬时态合并在 LocalSession 中。该恢复协议为 Python SDK 扩展，见 [Session 设计](sessions.md)。
+- Agent 默认创建 LocalSession。开启文件存储时，持久内容必须能序列化为 JSON；原始工具结果在后处理前保存。
 - 未指定 reasoning 时保留 provider 默认，而不主动发送 off。
 - `on_payload` 是观察副本的回调，不像 pi 那样允许任意覆盖整个请求体，避免绕过参数过滤。
 - Responses 完整原始 output 保存在 `responseOutput`，用于同 provider/model 的无状态 reasoning 重放。流式工具参数不完整时不交给执行器。
@@ -59,7 +61,7 @@
 - 原生 hosted tools、tool search、grammar/custom tools、语音等所有输出类型。遇到未实现的输出块会报错，不假装执行成功。
 - 完整跨模型历史修复、mid-conversation 原生工具变更协议；本版在请求边界折叠 system/tool 声明。
 - TypeBox 专用 symbol 语义与精确 tokenizer。
-- 数据库恢复点、Redis 租约、任务接管、权限后端、MCP 客户端与 SaaS 服务。
+- DB Session、Redis 租约、任务接管、权限后端、MCP 客户端与 SaaS 服务。
 
 这些边界不会隐藏在“与 pi 完全等价”的表述下。扩展其他 provider 时应继续对照固定或明确升级的 pi 版本。
 

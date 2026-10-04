@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import replace
 
 from .event_stream import EventStream
+from .sessions.base import SessionError, restore_model, tool_message
 from .stream_fn import get_default_stream_fn
 from .transcript import declare_tool_changes
 from .types import (
@@ -26,6 +27,8 @@ async def _hook(callback, *args):
 
 async def run_agent_loop(prompts, context, config, emit, signal=None, stream_fn=None):
     initial = declare_tool_changes(context, prompts)
+    if config.session:
+        await config.session.begin(context, initial, config)
     messages = list(initial)
     current = AgentContext(list(context.messages) + initial, list(context.tools))
     await maybe_await(emit({"type": "agent_start"}))
@@ -52,6 +55,8 @@ def _check_continue(context):
 
 async def run_agent_loop_continue(context, config, emit, signal=None, stream_fn=None):
     _check_continue(context)
+    if config.session:
+        await config.session.begin(context, [], config)
     messages = []
     current = AgentContext(list(context.messages), list(context.tools))
     await maybe_await(emit({"type": "agent_start"}))
@@ -63,6 +68,27 @@ async def run_agent_loop_continue(context, config, emit, signal=None, stream_fn=
         emit,
         signal or AbortSignal(),
         stream_fn or get_default_stream_fn(),
+    )
+    return messages
+
+
+async def run_agent_loop_resume(context, config, emit, signal=None, stream_fn=None):
+    if not config.session or not config.session.resumable:
+        raise SessionError("No unfinished session run to resume")
+    await config.session.commit("run_resumed")
+    current = AgentContext(config.session.snapshot["messages"], list(context.tools))
+    state = config.session.snapshot
+    messages = state["run_messages"]
+    await maybe_await(emit({"type": "agent_start"}))
+    await maybe_await(emit({"type": "turn_start"}))
+    await _run_loop(
+        current,
+        messages,
+        config,
+        emit,
+        signal or AbortSignal(),
+        stream_fn or get_default_stream_fn(),
+        recovering=True,
     )
     return messages
 
@@ -105,48 +131,112 @@ def _apply_update(context, config, update):
     )
 
 
-async def _run_loop(context, new_messages, config, emit, signal, stream_fn):
+async def _run_loop(context, new_messages, config, emit, signal, stream_fn, recovering=False):
     last_turn = None
     explicit_continue = False
-    pending = await _hook(config.get_steering_messages) or []
+    session = config.session
+    restored = session.snapshot if recovering else None
+    pending = (
+        await _hook(config.get_steering_messages) or []
+        if not recovering or (restored["phase"] == "model" and not restored["request"])
+        else []
+    )
     while True:
         has_tools = True
         while has_tools or pending:
-            prepared = []
-            if last_turn:
-                update = await _hook(config.prepare_next_turn, last_turn)
+            recovering_turn = restored and restored["phase"] != "model"
+            recovering_request = restored and restored["phase"] == "model" and restored["request"]
+            if not recovering_turn and not recovering_request:
+                prepared = []
+                if last_turn:
+                    update = await _hook(config.prepare_next_turn, last_turn)
+                    context, config = _apply_update(context, config, update)
+                    prepared = (update or {}).get("messages", [])
+                    if not pending:
+                        pending = await _hook(config.get_steering_messages) or []
+                    await maybe_await(emit({"type": "turn_start"}))
+                additions = declare_tool_changes(context, prepared + pending)
+                if session and additions:
+                    await session.commit("messages_added", messages=additions)
+                for message in additions:
+                    await _emit_message(message, emit)
+                    context.messages.append(message)
+                    new_messages.append(message)
+                pending = []
+                update = await _hook(
+                    config.prepare_request,
+                    {
+                        "context": context,
+                        "model": config.model,
+                        "thinking_level": config.options.get("reasoning", "off"),
+                    },
+                    signal,
+                )
                 context, config = _apply_update(context, config, update)
-                prepared = (update or {}).get("messages", [])
-                if not pending:
-                    pending = await _hook(config.get_steering_messages) or []
-                await maybe_await(emit({"type": "turn_start"}))
-            for message in declare_tool_changes(context, prepared + pending):
-                await _emit_message(message, emit)
-                context.messages.append(message)
+            if restored and (recovering_turn or recovering_request):
+                original = restore_model(restored["model"])
+                config = replace(
+                    config,
+                    model=replace(original, headers=config.model.headers),
+                    options={**config.options, **restored["options"]},
+                )
+            if recovering_turn:
+                message = restored["assistant"]
+            else:
+                message = await _stream_assistant(
+                    context,
+                    config,
+                    emit,
+                    signal,
+                    stream_fn,
+                    prepared_request=restored["request"] if recovering_request else None,
+                )
                 new_messages.append(message)
-            pending = []
-            update = await _hook(
-                config.prepare_request,
-                {
-                    "context": context,
-                    "model": config.model,
-                    "thinking_level": config.options.get("reasoning", "off"),
-                },
-                signal,
-            )
-            context, config = _apply_update(context, config, update)
-            message = await _stream_assistant(context, config, emit, signal, stream_fn)
-            new_messages.append(message)
             results = []
             hard_exit = message["stopReason"] in ("error", "aborted")
             calls = [c for c in message["content"] if c["type"] == "toolCall"]
             has_tools = False
-            if calls and not hard_exit:
+            if recovering_turn and restored["phase"] in ("finish_turn", "after_turn"):
+                results = [
+                    tool_message(
+                        c,
+                        restored["results"][c["id"]]["result"],
+                        restored["results"][c["id"]]["time"],
+                    )
+                    for c in calls
+                ]
+                has_tools = bool(calls) and not all(
+                    r["result"].get("terminate") is True for r in restored["results"].values()
+                )
+            elif calls and not hard_exit:
+                if session and signal.aborted:
+                    await session.commit(
+                        "run_interrupted",
+                        status="stopped",
+                        reason="Stop requested before tool execution",
+                    )
+                    await maybe_await(emit({"type": "agent_end", "messages": new_messages}))
+                    return
+                if recovering_turn:
+                    session.check_recovery_tools(calls, context.tools)
                 results, terminate = await _execute_tools(
                     context, message, calls, config, signal, emit
                 )
                 context.messages.extend(results)
                 new_messages.extend(results)
+                if session:
+                    if signal.aborted:
+                        await session.commit(
+                            "run_interrupted",
+                            status="stopped",
+                            reason="Stop requested during tool batch",
+                        )
+                        await maybe_await(
+                            emit({"type": "turn_end", "message": message, "toolResults": results})
+                        )
+                        await maybe_await(emit({"type": "agent_end", "messages": new_messages}))
+                        return
+                    await session.commit("tools_completed")
                 has_tools = not terminate
             last_turn = {
                 "message": message,
@@ -154,11 +244,27 @@ async def _run_loop(context, new_messages, config, emit, signal, stream_fn):
                 "context": context,
                 "newMessages": new_messages,
             }
-            decision = await _hook(config.finish_turn, last_turn, signal)
+            decision = (
+                restored["decision"]
+                if recovering_turn and restored["phase"] == "after_turn"
+                else await _hook(config.finish_turn, last_turn, signal)
+            )
+            if session:
+                if hard_exit:
+                    await session.commit(
+                        "run_interrupted",
+                        status="stopped" if signal.aborted else "failed",
+                        reason=message.get("errorMessage"),
+                    )
+                elif not (recovering_turn and restored["phase"] == "after_turn"):
+                    await session.commit("turn_completed", decision=decision)
+            restored = None
             await maybe_await(
                 emit({"type": "turn_end", "message": message, "toolResults": results})
             )
             if hard_exit or (decision or {}).get("action") == "end":
+                if session and not hard_exit:
+                    await session.commit("run_completed")
                 await maybe_await(emit({"type": "agent_end", "messages": new_messages}))
                 return
             explicit_continue = (decision or {}).get("action") == "continue"
@@ -174,18 +280,31 @@ async def _run_loop(context, new_messages, config, emit, signal, stream_fn):
             explicit_continue = False
             continue
         break
+    if session:
+        await session.commit("run_completed")
     await maybe_await(emit({"type": "agent_end", "messages": new_messages}))
 
 
-async def _stream_assistant(context, config, emit, signal, stream_fn):
+async def _stream_assistant(context, config, emit, signal, stream_fn, prepared_request=None):
     messages = context.messages
-    if config.transform_context:
+    if prepared_request:
+        llm_messages = prepared_request.get("llm_messages", config.session.snapshot["messages"])
+    elif config.transform_context:
         messages = await _hook(config.transform_context, messages, signal)
-    llm_messages = await _hook(config.convert_to_llm, messages)
+        llm_messages = await _hook(config.convert_to_llm, messages)
+    else:
+        llm_messages = await _hook(config.convert_to_llm, messages)
     key = await _hook(config.get_api_key, config.model.provider)
     options = {**config.options, "signal": signal}
     if key:
         options["api_key"] = key
+    if config.session:
+        options["_session"] = config.session
+        if prepared_request and prepared_request.get("provider_parameters"):
+            options["_resume_parameters"] = prepared_request["provider_parameters"]
+    if config.session and not prepared_request:
+        await config.session.request(context, config.model, options, llm_messages)
+    signal.throw_if_aborted()
     response = await maybe_await(stream_fn(config.model, AgentContext(llm_messages), options))
     try:
         return await _consume_assistant(response, context, config, emit)
@@ -223,6 +342,8 @@ async def _consume_assistant(response, context, config, emit):
             )
     final = await response.result()
     final["thinkingLevel"] = config.options.get("reasoning")
+    if config.session:
+        await config.session.model_finished(final)
     if added:
         context.messages[-1] = final
     else:
@@ -242,9 +363,14 @@ async def _prepare_tool(context, assistant, call, config, signal):
         return None, None, _error_result(f"Tool {call['name']} not found")
     try:
         args = call["arguments"]
-        if tool.prepare_arguments:
+        started = config.session.snapshot["started"].get(call["id"]) if config.session else None
+        if started:
+            args = deepcopy(started["args"])
+        elif tool.prepare_arguments:
             args = tool.prepare_arguments(deepcopy(args))
         args = validate_tool_arguments(tool, args)
+        if config.session and config.session.returned_result(call["id"]) is not None:
+            return tool, args, None
         before = await _hook(
             config.before_tool_call,
             {"assistantMessage": assistant, "toolCall": call, "args": args, "context": context},
@@ -256,6 +382,8 @@ async def _prepare_tool(context, assistant, call, config, signal):
             result["terminate"] = before.get("terminate", False)
             return None, None, result
         return tool, args, None
+    except SessionError:
+        raise
     except Exception as error:
         return None, None, _error_result(str(error))
 
@@ -270,12 +398,19 @@ async def _execute_prepared(context, assistant, call, tool, args, config, signal
         result = result.to_dict() if isinstance(result, AgentToolResult) else result
         updates.append(asyncio.create_task(maybe_await(on_update(result))))
 
+    result = config.session.returned_result(call["id"]) if config.session else None
     try:
-        signal.throw_if_aborted()
-        result = await maybe_await(tool.execute(call["id"], args, signal, update))
-        result = result.to_dict() if isinstance(result, AgentToolResult) else dict(result)
-    except Exception as error:
-        result = _error_result(str(error))
+        if result is None:
+            try:
+                signal.throw_if_aborted()
+                result = await maybe_await(tool.execute(call["id"], args, signal, update))
+                result = result.to_dict() if isinstance(result, AgentToolResult) else dict(result)
+            except SessionError:
+                raise
+            except Exception as error:
+                result = _error_result(str(error))
+            if config.session:
+                await config.session.tool_returned(call, result)
     finally:
         accepting = False
         if updates:
@@ -304,6 +439,8 @@ async def _execute_prepared(context, assistant, call, tool, args, config, signal
                     in ("content", "details", "structuredContent", "isError", "usage", "terminate")
                 }
             )
+    except SessionError:
+        raise
     except Exception as error:
         result = _error_result(str(error))
     return result
@@ -350,6 +487,8 @@ async def _execute_tools(context, assistant, calls, config, signal, emit):
     outcomes, tasks, messages = [], [], []
 
     async def end(call, result):
+        if config.session:
+            await config.session.tool_finished(call, result)
         await maybe_await(
             emit(
                 {
@@ -364,6 +503,8 @@ async def _execute_tools(context, assistant, calls, config, signal, emit):
         return call, result
 
     async def execute(call, tool, args):
+        if config.session and config.session.returned_result(call["id"]) is None:
+            await config.session.tool_started(call, args)
         result = await _execute_prepared(
             context,
             assistant,
@@ -384,6 +525,11 @@ async def _execute_tools(context, assistant, calls, config, signal, emit):
         )
         return await end(call, result)
 
+    def result_message(outcome):
+        return (
+            config.session.result_message(outcome[0]) if config.session else _tool_message(*outcome)
+        )
+
     for call in calls:
         await maybe_await(
             emit(
@@ -395,7 +541,10 @@ async def _execute_tools(context, assistant, calls, config, signal, emit):
                 }
             )
         )
-        if truncated:
+        saved = config.session.tool_result(call["id"]) if config.session else None
+        if saved is not None:
+            tool, args, result = None, None, saved
+        elif truncated:
             tool, args, result = (
                 None,
                 None,
@@ -415,7 +564,7 @@ async def _execute_tools(context, assistant, calls, config, signal, emit):
             outcome = None
         if sequential or truncated:
             outcomes.append(outcome)
-            msg = _tool_message(*outcome)
+            msg = result_message(outcome)
             await _emit_message(msg, emit)
             messages.append(msg)
         else:
@@ -433,7 +582,7 @@ async def _execute_tools(context, assistant, calls, config, signal, emit):
             running = [group.create_task(resolve(entry)) for entry in tasks]
         outcomes = [task.result() for task in running]
         for outcome in outcomes:
-            msg = _tool_message(*outcome)
+            msg = result_message(outcome)
             await _emit_message(msg, emit)
             messages.append(msg)
     return messages, bool(outcomes) and all(r.get("terminate") is True for _, r in outcomes)

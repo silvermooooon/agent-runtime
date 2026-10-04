@@ -6,5 +6,5 @@ Reference commit: 83692682f095528f8b71652ddacff7075e36e893
 Copyright (c) 2025 Mario Zechner
 License: MIT (see LICENSE)
 
-The initial Python port adds provider/model parameter policies and environment configuration.
+The Python port adds provider/model parameter policies, environment configuration, and local session recovery.
 See docs/porting.md for source mappings and differences. No upstream affiliation is implied.

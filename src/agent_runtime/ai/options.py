@@ -12,6 +12,8 @@ from .models import THINKING_LEVELS, clamp_thinking_level
 
 DEFAULT_THINKING_BUDGETS = {"minimal": 1024, "low": 2048, "medium": 8192, "high": 16384}
 RUNTIME_OPTIONS = {
+    "_session",
+    "_resume_parameters",
     "api_key",
     "signal",
     "headers",

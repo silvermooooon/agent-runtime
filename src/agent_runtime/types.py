@@ -125,6 +125,7 @@ class AgentTool:
     prepare_arguments: Hook | None = None
     execution_mode: ToolExecutionMode | None = None
     replay: Literal["never", "safe"] = "never"
+    version: str = ""
 
 
 @dataclass
@@ -152,6 +153,14 @@ class AgentLoopConfig:
     prepare_request: Hook | None = None
     prepare_next_turn: Hook | None = None
     tool_execution: ToolExecutionMode = "parallel"
+    session: Any = None
+    queue_modes: dict = field(
+        default_factory=lambda: {
+            "steering": "one-at-a-time",
+            "follow_up": "one-at-a-time",
+        }
+    )
+    queue_state: dict = field(default_factory=dict)
 
 
 def assistant_message(model: Model, **fields: Any) -> Message:
