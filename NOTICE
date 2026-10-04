@@ -1,5 +1,5 @@
 This project contains Python translations and adaptations of pi Agent, pi AI,
-and pi coding-agent tools and compaction/context projection logic.
+and pi coding-agent tools, MCP content projection, and compaction/context projection logic.
 
 Upstream: https://github.com/earendil-works/pi
 Original repository URL: https://github.com/badlogic/pi-mono

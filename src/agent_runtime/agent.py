@@ -530,6 +530,22 @@ class Agent:
             raise
         except Exception as error:
             if isinstance(error, BaseExceptionGroup) and error.split(SessionError)[0]:
+
+                def recovery_ids(exception):
+                    if isinstance(exception, ToolRecoveryRequired):
+                        return exception.call_ids
+                    if isinstance(exception, BaseExceptionGroup):
+                        return [i for child in exception.exceptions for i in recovery_ids(child)]
+                    return []
+
+                unknown = recovery_ids(error)
+                if unknown and not self.session._failed:
+                    recovery = ToolRecoveryRequired(unknown)
+                    self.state.error_message = str(recovery)
+                    await self.session.commit(
+                        "run_interrupted", status="waiting_recovery", reason=str(recovery)
+                    )
+                    raise recovery from error
                 self.state.error_message = str(error)
                 raise SessionError("Session failed during parallel tool execution") from error
             if self.session.resumable:

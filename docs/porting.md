@@ -36,6 +36,8 @@
 | packages/coding-agent/src/core/tools/write.ts、file-mutation-queue.ts | tools/write.py、tools/operations.py | 创建目录、写入、同文件修改队列 |
 | packages/coding-agent/src/core/tools/path-utils.ts、truncate.ts、output-accumulator.ts | tools/_paths.py、tools/_truncate.py、tools/_output.py | 路径兼容、输出截断、完整输出临时文件 |
 | packages/coding-agent/src/utils/image-*.ts、mime.ts | tools/_images.py | 图片识别、缩放、BMP 转换、附件大小限制 |
+| packages/mcp/src/protocol/content.ts | mcp/adapter.py | toLlmContent 文本、图片、嵌入资源和结构化结果投影 |
+| packages/coding-agent/src/extensions/mcp/tools.ts | mcp/adapter.py、mcp/caller.py | MCP 结果适配普通工具、错误标志及进度通知的接口思路 |
 
 ## 保留的调度语义
 
@@ -67,6 +69,8 @@
 - 四个内置工具的默认参数和主要行为参考上述固定版本；工具必须显式装配。图片后端使用 Pillow，diff 使用 difflib，因此编码结果和 diff 分块不保证逐字节等同于上游。
 - 文件修改队列使用事件循环内的 asyncio.Lock，等待正在执行的 I/O 结束后释放；不是数据库锁，也不是跨进程锁。工具恢复沿用 SDK 的 replay 协议。
 - 未移植 coding-agent 的 TUI renderer、提示词元数据注入和模型专用图片配置；常用使用说明放入工具 description，图片限制可通过工厂参数显式配置。本地 bash 的进程组取消测试覆盖 macOS/POSIX；Windows 未验证，Windows 默认后端只终止直接子进程。
+- MCP 协议收发复用官方 Python `mcp` 2.3 客户端，使用 `ClientSession.send_request` 避免高层 `call_tool` 隐式发现 schema。默认按次连接，平台提供已选 schema 和身份上下文；未移植 Pi 的发现、schema 缓存、OAuth、codemode、资源读取及截断管理。
+- MCP 的模型内容投影直接翻译上述 `toLlmContent`；完整结果另外保留在现有工具结果的 details 内。业务名称使用约定的 `server.tool`，在默认 AI 协议层转为 `server__tool` 后还原，没有移植 Pi 的 hash 命名和冲突处理。
 
 ## 初版未移植范围
 
@@ -76,7 +80,7 @@
 - 原生 hosted tools、tool search、grammar/custom tools、语音等所有输出类型。遇到未实现的输出块会报错，不假装执行成功。
 - 完整跨模型历史修复、mid-conversation 原生工具变更协议；本版在请求边界折叠 system/tool 声明。
 - TypeBox 专用 symbol 语义与精确 tokenizer。
-- DB Session、Redis 租约、任务接管、权限后端、MCP 客户端与 SaaS 服务。
+- DB Session、Redis 租约、任务接管、权限后端、MCP 工具发现与 SaaS 服务。
 
 这些边界不会隐藏在“与 pi 完全等价”的表述下。扩展其他 provider 时应继续对照固定或明确升级的 pi 版本。
 
@@ -86,5 +90,7 @@
 HTTP 测试使用 httpx MockTransport 注入 Responses、Completions、Anthropic、proxy SSE，验证实际请求体及流解析。参数测试使用合成模型元数据，不绑定特定新模型名称。
 
 内置工具测试使用真实临时文件和本地 shell，覆盖分页、图片、批量编辑、并发修改、输出截断、超时、取消、审批及 Session 恢复；模型调度部分使用 FakeProvider。
+
+MCP 测试使用真实本地 HTTP/stdio 传输，验证不触发发现、逐请求头透传、并发身份隔离、审批、进度、完整结果存储、超时及未知结果恢复。`examples/mcp_tools.py` 使用官方 MCPServer 验证 stdio 互操作，`tests/live_mcp.py` 单独验证真实模型到本地 MCP 的工具循环。
 
 真实 provider 测试与离线测试分开运行，已有官方 Responses API 与 gpt-6-luna 的实测记录，见 [在线测试说明](live-testing.md)。这不表示所有厂商兼容端点都已通过验证。

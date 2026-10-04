@@ -14,6 +14,7 @@ from .messages import build_payload
 from .models import builtin_models, clamp_thinking_level, supported_thinking_levels
 from .options import ParameterReport, adjust_max_tokens_for_thinking, normalize_parameters
 from .parsers import AnthropicParser, CompletionsParser, ResponsesParser
+from .tool_names import ToolNameStream
 from .transport import stream_http
 
 PARSERS = {
@@ -115,6 +116,7 @@ class Models:
         if model.api in self._streams:
             return self._streams[model.api](model, context, options)
         stream = AssistantMessageEventStream()
+        named_stream = ToolNameStream(stream, context)
         output = assistant_message(model)
         signal = options.get("signal") or AbortSignal()
 
@@ -166,8 +168,8 @@ class Models:
                     headers.setdefault("Authorization", f"Bearer {key}")
                 if not any(name.lower() in ("authorization", "x-api-key") for name in headers):
                     raise ValueError(f"No API key for provider: {model.provider}")
-                parser = PARSERS[model.api](output, stream)
-                stream.push({"type": "start", "partial": deepcopy(output)})
+                parser = PARSERS[model.api](output, named_stream)
+                named_stream.push({"type": "start", "partial": deepcopy(output)})
 
                 async def on_response(info):
                     if options.get("on_response"):
@@ -198,14 +200,18 @@ class Models:
 
             try:
                 await signal.run(request())
-                stream.push({"type": "done", "reason": output["stopReason"], "message": output})
+                named_stream.push(
+                    {"type": "done", "reason": output["stopReason"], "message": output}
+                )
             except (Exception, asyncio.CancelledError) as error:
                 aborted = signal.aborted or isinstance(
                     error, (OperationAborted, asyncio.CancelledError)
                 )
                 output["stopReason"] = "aborted" if aborted else "error"
                 output["errorMessage"] = str(error) or "Operation aborted"
-                stream.push({"type": "error", "reason": output["stopReason"], "error": output})
+                named_stream.push(
+                    {"type": "error", "reason": output["stopReason"], "error": output}
+                )
 
         stream.task = asyncio.create_task(produce())
         return stream

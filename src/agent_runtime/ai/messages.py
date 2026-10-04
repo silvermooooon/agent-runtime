@@ -4,6 +4,7 @@ import json
 from copy import deepcopy
 
 from ..transcript import content_text, current_tools, system_prompt
+from .tool_names import encode_tool_names
 
 
 def _blocks(message):
@@ -47,11 +48,11 @@ def _tool_output(message, api):
 
 def build_payload(model, context, parameters):
     if model.api == "openai-responses":
-        return _responses(model, context, parameters)
+        return encode_tool_names(_responses(model, context, deepcopy(parameters)))
     if model.api == "openai-completions":
-        return _completions(model, context, parameters)
+        return encode_tool_names(_completions(model, context, deepcopy(parameters)))
     if model.api == "anthropic-messages":
-        return _anthropic(model, context, parameters)
+        return encode_tool_names(_anthropic(model, context, deepcopy(parameters)))
     raise ValueError(f"Unsupported API: {model.api}")
 
 

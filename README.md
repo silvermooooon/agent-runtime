@@ -60,6 +60,7 @@ uv run --env-file .env python tests/live_openai.py --live
 - 单份 Session 日志推导上下文；可选摘要压缩、事件节点查询及分叉到独立新会话。
 - `agent_loop` / `run_agent_loop`：流式或可等待事件 sink 的低层入口。
 - 工具 JSON Schema 校验、参数准备、执行前后钩子、串行／并行执行。
+- 显式装配 MCP 工具：HTTP/stdio 调用、动态请求头、已有工具审批和恢复流程。
 - `finish_turn`、`prepare_request`、`prepare_next_turn`、上下文转换与动态 API key。
 - 三种 HTTP SSE 协议：OpenAI Responses、OpenAI Chat Completions、Anthropic Messages。
 - provider/model 注册、API 实现注入、参数过滤与模型限制处理。
@@ -116,6 +117,12 @@ await agent.prompt("检查并修改这个工作目录中的代码。")
 
 `create_coding_tools` 返回 `read`、`bash`、`edit`、`write`。也可以分别使用 `create_read_tool` 等工厂，只启用需要的工具。工具参数、替换执行后端、审批与恢复说明见 [内置工具](docs/tools.md)，完整示例见 [coding_tools.py](examples/coding_tools.py)。
 
+MCP 工具由独立的 `agent_runtime.mcp` 模块提供。平台传入已发现、已选择的 schema，`assemble_tools` 根据 `type: builtin | mcp` 组装；MCP 业务名称为 `server.tool`。支持 Streamable HTTP、stdio、静态和动态请求头，沿用现有审批及 Session 恢复。完整用法及边界见 [MCP 调用](docs/mcp.md)，无需 API Key 的真实 stdio 示例：
+
+```bash
+uv run python examples/mcp_tools.py
+```
+
 自定义工具仍沿用原有接口：
 
 ```python
@@ -137,7 +144,7 @@ tool = AgentTool(
 
 `execute` 建议使用异步函数；同步函数不能执行阻塞 I/O，否则会阻塞事件循环。
 `on_update(partial_result)` 是同步调度回调，结算时会等待已发送更新；工具返回后再调用它不会继续发事件。
-工具错误成为 `isError` 结果传给模型；被 token 上限截断的工具调用不会执行。
+普通工具错误成为 `isError` 结果传给模型；MCP 调用结果未知时暂停核实，不自动重试。被 token 上限截断的工具调用不会执行。
 
 ## Session 与恢复
 

@@ -1,6 +1,6 @@
 # 真实 OpenAI 测试
 
-普通的 `unittest discover` 仍使用 FakeProvider 和 MockTransport，不消耗 API 用量。真实测试独立运行：
+普通的 `unittest discover` 对模型使用 FakeProvider 和 MockTransport；MCP 集成测试使用本地 HTTP/stdio 服务，均不消耗模型 API 用量。真实模型测试独立运行：
 
 ```bash
 uv run --env-file .env python tests/live_openai.py --live
@@ -95,4 +95,23 @@ Session 文件使用临时目录，测试结束后清理。此次实测不覆盖
 req_f0fe40cd70ee4705bb38435bfe603aeb
 req_549dc49a14f343a4aaf8526dc0fc5425
 req_5337614e9f3a4cee8548261730b76f5c
+```
+
+## 2026-10-05 MCP 调用实测通过
+
+独立入口：
+
+```bash
+uv run --env-file .env python tests/live_mcp.py --live
+```
+
+固定官方 Responses API 和 `gpt-6-luna`，最多 3 次请求、每次最多 512 输出 token、20 秒网络操作超时，整个 Agent 运行上限 90 秒。使用项目 `.env` 的凭据和代理配置，没有修改系统配置。
+
+本次 2 次真实请求均为 HTTP 200：模型选择 `demo.echo`，SDK 调用本地 HTTP MCP 测试服务一次，再把工具结果发给模型，最终返回 `mcp-runtime-ok`，Session 为 `completed`。模型未使用 MockTransport 或 FakeProvider；MCP 是真实协议交互的本地测试服务，不是外部生产 MCP 服务。
+
+同时验证：未发起 `tools/list`；初始化、工具调用和关闭等 HTTP 请求带上指定测试身份头；业务工具名和模型协议工具名正确转换；完整 MCP 结果进入 `tool_returned`，请求头没有进入 Session 日志。超时、取消、并发隔离和未知结果恢复由离线测试覆盖，此次实测仅确认成功链路。
+
+```text
+req_3aa14a64f226462fa23203e57ed786ed
+req_eb0f025d39b742bf91577932b131fde8
 ```
