@@ -286,6 +286,10 @@ async def _run_loop(context, new_messages, config, emit, signal, stream_fn, reco
 
 
 async def _stream_assistant(context, config, emit, signal, stream_fn, prepared_request=None):
+    if not prepared_request and config.compact_context:
+        context.messages = await _hook(
+            config.compact_context, context, config.model, config.options, signal
+        )
     messages = context.messages
     if prepared_request:
         llm_messages = prepared_request.get("llm_messages", config.session.snapshot["messages"])

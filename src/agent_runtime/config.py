@@ -10,6 +10,8 @@ from urllib.parse import urlparse
 
 from .types import ParameterPolicy
 
+DEFAULT_MODEL = "gpt-6-luna"
+
 
 @dataclass
 class ProviderConfig:
@@ -23,7 +25,7 @@ class ProviderConfig:
 @dataclass
 class RuntimeConfig:
     provider: str = "openai"
-    model: str | None = None
+    model: str | None = DEFAULT_MODEL
     api: str | None = None
     timeout: float = 120
     parameters: dict = field(default_factory=dict)
@@ -77,7 +79,7 @@ class RuntimeConfig:
             providers[provider] = ProviderConfig(provider, api, url, text(prefix + "_API_KEY"))
         return cls(
             provider=text("AGENT_PROVIDER", "openai"),
-            model=text("AGENT_MODEL"),
+            model=text("AGENT_MODEL", DEFAULT_MODEL),
             api=text("AGENT_API"),
             timeout=timeout,
             parameters=parameters,

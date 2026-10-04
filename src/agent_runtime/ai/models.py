@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 
+from ..config import DEFAULT_MODEL
 from ..types import Model
 
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
@@ -35,7 +36,20 @@ def clamp_thinking_level(model: Model, level: str) -> str:
 
 def builtin_models() -> list[Model]:
     openai_url = "https://api.openai.com/v1"
+    # https://developers.openai.com/api/docs/models/gpt-6-luna
+    # https://developers.openai.com/api/docs/guides/latest-model (parameter compatibility)
     result = [
+        Model(
+            DEFAULT_MODEL,
+            "openai",
+            "openai-responses",
+            openai_url,
+            reasoning=True,
+            max_tokens=128000,
+            context_window=1050000,
+            thinking_level_map={"off": "none", "minimal": None, "xhigh": "xhigh", "max": "max"},
+            compat={"default_reasoning": "medium", "sampling_requires_reasoning_none": True},
+        ),
         Model(
             "gpt-4.1",
             "openai",
@@ -44,7 +58,7 @@ def builtin_models() -> list[Model]:
             reasoning=False,
             max_tokens=32768,
             context_window=1047576,
-        )
+        ),
     ]
     # Concrete older Claude family using pi's budget-based thinking branch.
     result.append(
@@ -58,7 +72,7 @@ def builtin_models() -> list[Model]:
             context_window=200000,
         )
     )
-    chat = deepcopy(result[0])
+    chat = deepcopy(result[1])
     chat.provider = "openai-chat"
     chat.api = "openai-completions"
     result.append(chat)

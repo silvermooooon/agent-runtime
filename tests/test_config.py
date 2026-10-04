@@ -18,10 +18,11 @@ from agent_runtime import (
 
 
 class ConfigTests(unittest.IsolatedAsyncioTestCase):
-    def test_responses_default_and_model_required(self):
+    def test_responses_default_and_luna_model(self):
         with patch.dict("os.environ", {}, clear=True):
-            with self.assertRaisesRegex(ValueError, "AGENT_MODEL"):
-                Agent()
+            default = Agent()
+            self.assertEqual(default.state.model.id, "gpt-6-luna")
+            self.assertEqual(default.state.model.api, "openai-responses")
             agent = Agent(model="deployment")
             self.assertEqual(agent.state.model.provider, "openai")
             self.assertEqual(agent.state.model.api, "openai-responses")
@@ -50,6 +51,27 @@ class ConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(explicit.state.model.api, "openai-completions")
         self.assertEqual(explicit.state.model.base_url, "https://explicit.invalid/v1")
         self.assertEqual(explicit.parameters["max_tokens"], 500)
+
+    def test_luna_metadata_filters_sampling_without_name_heuristics(self):
+        from agent_runtime import normalize_parameters
+
+        model = Models(env={}).get_model()
+        report = normalize_parameters(model, {"temperature": 0.3, "top_p": 0.8})
+        self.assertEqual(set(report.dropped), {"temperature", "top_p"})
+        report = normalize_parameters(model, {"reasoning": "none", "temperature": 0.3})
+        self.assertEqual(report.parameters["reasoning"], {"effort": "none"})
+        self.assertEqual(report.parameters["temperature"], 0.3)
+        report = normalize_parameters(model, {"reasoning": "minimal"})
+        self.assertEqual(report.parameters["reasoning"], {"effort": "low"})
+
+    def test_default_does_not_replace_explicit_model(self):
+        from agent_runtime import LocalSession
+
+        session = LocalSession(directory=None)
+        self.assertEqual(Agent(session=session, env={}).state.model.id, "gpt-6-luna")
+        self.assertEqual(
+            Agent(session=session, model="deployment", env={}).state.model.id, "deployment"
+        )
 
     async def test_env_endpoint_and_credentials_reach_http_request(self):
         requests = []
@@ -183,6 +205,6 @@ class ConfigTests(unittest.IsolatedAsyncioTestCase):
                 "AGENT_TIMEOUT_SECONDS": "",
             }
         )
-        self.assertIsNone(cfg.model)
+        self.assertEqual(cfg.model, "gpt-6-luna")
         self.assertEqual(cfg.timeout, 120)
         self.assertEqual(cfg.providers["openai"].base_url, "https://api.openai.com/v1")

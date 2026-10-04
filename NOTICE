@@ -1,4 +1,5 @@
-This project contains Python translations and adaptations of pi Agent and pi AI logic.
+This project contains Python translations and adaptations of pi Agent, pi AI,
+and pi coding-agent tools and compaction/context projection logic.
 
 Upstream: https://github.com/earendil-works/pi
 Original repository URL: https://github.com/badlogic/pi-mono
@@ -6,5 +7,6 @@ Reference commit: 83692682f095528f8b71652ddacff7075e36e893
 Copyright (c) 2025 Mario Zechner
 License: MIT (see LICENSE)
 
-The Python port adds provider/model parameter policies, environment configuration, and local session recovery.
+The Python port adds provider/model parameter policies, environment configuration,
+local execution recovery, and independent session forks from journal event IDs.
 See docs/porting.md for source mappings and differences. No upstream affiliation is implied.

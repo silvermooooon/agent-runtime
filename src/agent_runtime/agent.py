@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from uuid import uuid4
 
 from .agent_loop import run_agent_loop, run_agent_loop_continue, run_agent_loop_resume
 from .ai import Models
+from .ai.estimate import estimate_message_tokens
+from .compaction import CompactionSettings, Compactor
 from .sessions import LocalSession, SessionError, ToolRecoveryRequired
-from .sessions.base import restore_model, tool_records
+from .sessions.base import model_record, restore_model, saved_options, tool_records
+from .sessions.projection import apply_compaction
 from .stream_fn import get_default_stream_fn
 from .transcript import current_system_message, system_prompt, tool_declaration
 from .types import (
@@ -87,6 +90,7 @@ class Agent:
         steering_mode=None,
         follow_up_mode=None,
         tool_execution=None,
+        compaction: CompactionSettings | Compactor | None = None,
     ):
         self.session = session if session is not None else LocalSession()
         restored = self.session.snapshot
@@ -136,6 +140,9 @@ class Agent:
         self.api_key = api_key
         self.convert_to_llm = convert_to_llm
         self.transform_context = transform_context
+        self.compactor = (
+            Compactor(compaction) if isinstance(compaction, CompactionSettings) else compaction
+        )
         self.get_api_key = get_api_key
         self.before_tool_call = before_tool_call
         self.after_tool_call = after_tool_call
@@ -276,6 +283,149 @@ class Agent:
         self._check_idle()
         return await self._run(None, resume=True)
 
+    async def compact(self, instructions=None, *, summary=None, first_kept_message_id=None):
+        """Compact an idle session; optionally supply a summary and an explicit retained boundary.
+
+        Returns the committed compaction event. None boundary with a supplied summary retains
+        no old conversational messages. Generated summaries use the configured recent budget.
+        """
+        self._check_idle()
+        await self.session.acquire()
+        try:
+            if self.session.revision != self._session_revision:
+                raise SessionError("Session changed; reopen Agent before compacting")
+            if self.session.resumable:
+                raise SessionError("Resume unfinished work before manual compaction")
+        except BaseException:
+            await self.session.release()
+            raise
+        try:
+            self.state.is_streaming = True
+            self.signal = AbortSignal()
+            self._idle.clear()
+            return await self._compact(
+                self.state.model,
+                {**self.parameters, "reasoning": self.state.thinking_level},
+                self.signal,
+                reason="manual",
+                instructions=instructions,
+                summary=summary,
+                first_kept_message_id=first_kept_message_id,
+            )
+        finally:
+            self.state.messages = self.session.build_context()
+            self.state.is_streaming = False
+            self.signal = None
+            await self.session.release()
+            self._session_revision = self.session.revision
+            self._idle.set()
+
+    async def _compact_before_request(self, context, model, options, signal):
+        await self.session.sync_context(context.messages)
+        if self.compactor.should_compact(context.messages, model):
+            await self._compact(model, options, signal, reason="threshold")
+        self.state.messages = self.session.build_context()
+        return self.session.build_context()
+
+    async def _compact(
+        self,
+        model,
+        options,
+        signal,
+        *,
+        reason,
+        instructions=None,
+        summary=None,
+        first_kept_message_id=None,
+    ):
+        compactor = self.compactor or Compactor()
+        plan = compactor.prepare(self.session) if summary is None else None
+        if summary is None and plan is None:
+            if reason == "manual":
+                raise ValueError("Nothing to compact with the current keep_recent_tokens budget")
+            return None
+        boundary = plan.first_kept_message_id if plan else first_kept_message_id
+        tokens_before = (
+            plan.tokens_before
+            if plan
+            else sum(estimate_message_tokens(m) for m in self.session.build_context())
+        )
+        candidate = self.session.snapshot
+        prior_compaction = candidate["compaction"]
+        apply_compaction(
+            candidate,
+            {
+                "id": "validation",
+                "type": "compaction",
+                "time": 0,
+                "data": {
+                    "summary": summary if summary is not None else "pending",
+                    "first_kept_message_id": boundary,
+                },
+            },
+        )
+        await self.session.commit(
+            "compaction_started",
+            reason=reason,
+            first_kept_message_id=boundary,
+            tokens_before=tokens_before,
+            model=model_record(model),
+            settings=asdict(compactor.settings),
+            instructions=instructions,
+        )
+        details = {"reason": reason, "provided": summary is not None}
+        try:
+            await self._process({"type": "compaction_start", "reason": reason})
+            if summary is None:
+                request_options = {**options}
+                if self.api_key:
+                    request_options["api_key"] = self.api_key
+                if self.get_api_key:
+                    key = await maybe_await(self.get_api_key(model.provider))
+                    if key:
+                        request_options["api_key"] = key
+                summary, generated = await compactor.generate(
+                    plan, model, self.stream_function, request_options, signal, instructions
+                )
+                details.update(generated)
+                details["parameters"] = saved_options(request_options)
+            signal.throw_if_aborted()
+            record = await self.session.compact(
+                summary, boundary, tokens_before=tokens_before, details=details
+            )
+        except (Exception, asyncio.CancelledError) as error:
+            if self.session.snapshot["compaction"] != prior_compaction:
+                # Cancellation may arrive while commit waits for fsync. A committed summary
+                # stays successful in the journal even if the caller's task is cancelled.
+                raise
+            if not self.session._failed:
+                await self.session.commit(
+                    "compaction_failed",
+                    reason=reason,
+                    error=str(error),
+                    aborted=signal.aborted or isinstance(error, asyncio.CancelledError),
+                )
+            await self._process(
+                {
+                    "type": "compaction_end",
+                    "reason": reason,
+                    "result": None,
+                    "errorMessage": str(error),
+                    "aborted": signal.aborted or isinstance(error, asyncio.CancelledError),
+                }
+            )
+            raise
+        self.state.messages = self.session.build_context()
+        await self._process(
+            {
+                "type": "compaction_end",
+                "reason": reason,
+                "result": record,
+                "aborted": False,
+            }
+        )
+        return record
+
     async def _run(self, prompts, skip_initial_steering=False, resume=False):
         self._check_idle()
         await self.session.acquire()
@@ -342,6 +492,7 @@ class Agent:
             finish_turn=self.finish_turn,
             prepare_request=self.prepare_request,
             prepare_next_turn=self.prepare_next_turn,
+            compact_context=self._compact_before_request if self.compactor else None,
             tool_execution=self.tool_execution,
             session=self.session,
             queue_modes={"steering": self._steering.mode, "follow_up": self._follow_up.mode},

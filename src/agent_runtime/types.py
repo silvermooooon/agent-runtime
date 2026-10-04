@@ -152,6 +152,7 @@ class AgentLoopConfig:
     finish_turn: Hook | None = None
     prepare_request: Hook | None = None
     prepare_next_turn: Hook | None = None
+    compact_context: Hook | None = None
     tool_execution: ToolExecutionMode = "parallel"
     session: Any = None
     queue_modes: dict = field(

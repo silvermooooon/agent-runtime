@@ -13,13 +13,13 @@ uv run python -m unittest discover -s tests -v
 
 也可以使用 `python -m pip install -e .`。凭据由参数、实例级配置或对应环境变量注入，仓库中不保存真实凭据。
 
-使用 Responses API：复制 [.env.template](.env.template) 为 `.env`，填写 `AGENT_MODEL`、`OPENAI_API_KEY`，按需修改 `OPENAI_BASE_URL`，然后执行：
+使用 Responses API：复制 [.env.template](.env.template) 为 `.env`，填写 `OPENAI_API_KEY`，默认模型为 `gpt-6-luna`，按需修改 `OPENAI_BASE_URL`，然后执行：
 
 ```bash
 uv run --env-file .env python examples/openai_responses.py
 ```
 
-SDK 默认读取进程环境变量，不自动搜索 `.env`。`uv --env-file` 负责将文件加载到进程环境；生产环境直接注入环境变量即可。`Agent()` 默认 provider 为 `openai`、协议为 `openai-responses`，模型名来自 `AGENT_MODEL`；未配置模型名会提示错误，不替用户选择模型。
+SDK 默认读取进程环境变量，不自动搜索 `.env`。`uv --env-file` 负责将文件加载到进程环境；生产环境直接注入环境变量即可。`Agent()` 默认 provider 为 `openai`、协议为 `openai-responses`、模型为 `gpt-6-luna`。显式模型参数或非空 `AGENT_MODEL` 可以覆盖默认值；调用失败不会自动切换模型。
 
 ```python
 import asyncio
@@ -45,10 +45,19 @@ async def main():
 asyncio.run(main())
 ```
 
+真实 OpenAI 集成测试单独运行，不包含在普通离线测试中，会产生 API 用量。该入口只允许官方 Responses API 和 `gpt-6-luna`：
+
+```bash
+uv run --env-file .env python tests/live_openai.py --live
+```
+
+测试覆盖文本增量、工具循环、保存工具计划后的恢复、文本流中断后的重新请求；恢复阶段使用独立进程读取同一 Session 文件。详见 [在线测试说明](docs/live-testing.md)。
+
 ## 当前范围
 
 - `Agent`：状态、订阅、取消、继续执行、steering/follow-up 队列。
 - 内置 `LocalSession`：瞬时内存状态、按会话保存的 JSONL 文件、可靠边界恢复。
+- 单份 Session 日志推导上下文；可选摘要压缩、事件节点查询及分叉到独立新会话。
 - `agent_loop` / `run_agent_loop`：流式或可等待事件 sink 的低层入口。
 - 工具 JSON Schema 校验、参数准备、执行前后钩子、串行／并行执行。
 - `finish_turn`、`prepare_request`、`prepare_next_turn`、上下文转换与动态 API key。
@@ -91,6 +100,23 @@ provider 已知时可以直接传任意模型／部署名；没有元数据的�
 完整规则与限制见 [参数兼容](docs/parameters.md)。在 `parameters` 中设置 `on_parameters(report, model)` 可以观察每次请求的过滤结果；`on_payload(payload, model)` 仅观察请求副本，不能绕过过滤。
 
 ## 工具
+
+SDK 随包提供 pi 的四个核心工具，放在独立的 `agent_runtime.tools` 模块中。`Agent()` 默认不启用任何工具，需要在组装时显式声明：
+
+```python
+from agent_runtime import Agent
+from agent_runtime.tools import create_coding_tools
+
+agent = Agent(
+    tools=create_coding_tools(cwd="/path/to/workspace"),
+    system_prompt="先读取文件，再执行修改。",
+)
+await agent.prompt("检查并修改这个工作目录中的代码。")
+```
+
+`create_coding_tools` 返回 `read`、`bash`、`edit`、`write`。也可以分别使用 `create_read_tool` 等工厂，只启用需要的工具。工具参数、替换执行后端、审批与恢复说明见 [内置工具](docs/tools.md)，完整示例见 [coding_tools.py](examples/coding_tools.py)。
+
+自定义工具仍沿用原有接口：
 
 ```python
 from agent_runtime import AgentTool, AgentToolResult
@@ -146,6 +172,47 @@ uv run python examples/local_session.py resume --session-id demo
 
 第一条保存工具计划并停止，第二条从文件恢复并完成工具与模型循环。
 使用方式、文件格式、工具恢复决策和限制详见 [Session 生命周期](docs/sessions.md)。
+
+## 上下文压缩与历史节点分叉
+
+每个会话仍只有一份 `events.jsonl`。摘要和保留边界追加到同一日志，`Agent.state.messages` 与
+`session.build_context()` 是从日志推导的内存视图，压缩前的消息继续保留在原记录中。
+
+```python
+from agent_runtime import Agent, CompactionSettings, LocalSession
+
+session = LocalSession("conversation-123", directory="./sessions")
+agent = Agent(
+    session=session,
+    tools=tools,
+    compaction=CompactionSettings(reserve_tokens=16384, keep_recent_tokens=20000),
+)
+await agent.prompt("处理任务")
+
+# 可选：空闲时主动生成摘要，沿用 Agent 当前的模型和 provider。
+# await agent.compact("保留用户约束、已完成的修改和下一步")
+
+# 浏览完整历史，每个持久化事件有稳定 id。
+records = session.read_records()
+event_id = records[-1]["id"]
+context_at_node = session.build_context(event_id)
+
+# 复制该节点及之前的全部记录，创建新的 Session ID 和独立日志。
+child = await session.fork(event_id, session_id="conversation-branch")
+child_agent = Agent(session=child, tools=tools)
+if child.resumable:
+    await child_agent.resume()
+else:
+    await child_agent.prompt("从这里尝试另一种做法")
+```
+
+自动压缩需要显式传入 `compaction`；手动压缩也支持宿主提供摘要，不必调用模型。
+从未完成步骤分叉会保留恢复状态，结果未知的副作用工具仍需核实。
+完整语义见 [压缩、投影与分叉](docs/context.md)。离线示例：
+
+```bash
+uv run python examples/session_projection.py
+```
 
 ## 外层集成边界
 

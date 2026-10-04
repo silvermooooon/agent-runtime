@@ -36,7 +36,8 @@ sessions/
 ```
 
 `events.jsonl` 为追加写入的结构化记录。每条有格式版本、session 身份、连续序号和 SHA-256 校验；
-逻辑记录有 `type`、`seq`、`time`、`run_id`、`data`。
+逻辑记录有稳定 `id`、`type`、`seq`、`time`、`run_id`、`data`。`seq` 用于会话内顺序，
+`id` 用于历史节点查询和分叉；旧格式没有 id 时，读取器从原 session ID 和 seq 推导稳定 ID，不重写文件。
 
 | 记录 | 内容与作用 |
 | --- | --- |
@@ -52,6 +53,10 @@ sessions/
 | tools_completed / turn_completed | 批次结束、工具结果的模型顺序、finish_turn 决策 |
 | run_completed / run_interrupted / run_resumed | 正常结束、停止／中断及恢复尝试 |
 | tool_retry_authorized / history_reset | 外部明确决定重试未知工具结果或放弃当前工作 |
+| compaction_started / compaction_failed | 摘要生成尝试、范围、配置和失败原因 |
+| compaction | 完整摘要、保留消息边界、估算 token 数及生成详情 |
+| context_replaced | 自定义请求准备改变上下文时，记录新的选择结果 |
+| session_forked | 新会话来源的 session ID 和 event ID；之前已复制完整前缀 |
 
 常规执行不在每个边界重复存储整份历史；完整历史由记录推导。
 自定义上下文替换或转换改变实际模型输入时，需要保留相应快照。
@@ -103,9 +108,13 @@ else:
 | turn_completed | 复用已经保存的 finish_turn 决策 |
 | run_completed | 展示结果，resume 会提示没有未完成工作 |
 
-内存快照不需要持久化。初版恢复读取完整有效日志前缀并重建投影，尚无日志压缩、历史分页索引或定期快照加速。
+内存快照不需要持久化。恢复读取完整有效日志前缀并重建投影，包括已提交的上下文压缩记录。
+尚无存储日志的物理压缩、历史分页索引或定期快照加速。
 业务查询可使用 `session.snapshot`、`session.revision` 和 `session.read_records(after_seq=...)`。
 跨进程的冷查询需重新打开 LocalSession；既有读对象不自动监视其他进程的新写入。
+
+历史查询使用 `snapshot_at(event_id)` / `build_context(event_id)`；`fork(event_id)` 将前缀复制为独立的新会话，
+不在原日志建立多分支。单份日志、压缩及分叉细节见 [上下文设计](context.md)。
 
 ## 工具结果未知
 

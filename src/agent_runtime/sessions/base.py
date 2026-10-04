@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from ..transcript import tool_declaration
 from ..types import AgentToolResult, Model, ParameterPolicy, default_convert_to_llm, timestamp
+from .projection import append_messages, apply_compaction, replace_messages
 
 
 class SessionError(RuntimeError):
@@ -80,6 +81,10 @@ def tool_records(tools):
 def empty_state():
     return {
         "messages": [],
+        "message_ids": [],
+        "compaction": None,
+        "compaction_attempt": None,
+        "origin": None,
         "status": "idle",
         "phase": "idle",
         "run_id": None,
@@ -137,9 +142,9 @@ def reduce_record(state, record):
                 if message not in state[key]:
                     state[key].append(message)
         if "context" in data:
-            state["messages"] = data["context"]
+            replace_messages(state, data["context"], record, "context")
         state["run_start"] = len(state["messages"])
-        state["messages"].extend(data["inputs"])
+        append_messages(state, data["inputs"], record, "inputs")
         state["run_messages"] = list(data["inputs"])
         consume_queues(state, data["inputs"])
         state.update(
@@ -163,7 +168,7 @@ def reduce_record(state, record):
             step_id=None,
         )
     elif kind == "messages_added":
-        state["messages"].extend(data["messages"])
+        append_messages(state, data["messages"], record, "messages")
         state["run_messages"].extend(data["messages"])
         consume_queues(state, data["messages"])
     elif kind == "queues":
@@ -172,7 +177,7 @@ def reduce_record(state, record):
         state[data["queue"]].append(data["message"])
     elif kind == "model_request":
         if "context" in data:
-            state["messages"] = data["context"]
+            replace_messages(state, data["context"], record, "context")
         state.update(
             model=data["model"],
             options=data["options"],
@@ -189,7 +194,7 @@ def reduce_record(state, record):
         ids = [b["id"] for b in data["message"]["content"] if b["type"] == "toolCall"]
         if len(ids) != len(set(ids)):
             raise SessionError("Tool call IDs must be unique within one model response")
-        state["messages"].append(data["message"])
+        append_messages(state, [data["message"]], record, "message")
         state["run_messages"].append(data["message"])
         state.update(
             assistant=data["message"],
@@ -217,11 +222,11 @@ def reduce_record(state, record):
     elif kind == "tool_retry_authorized":
         state["started"].pop(data["call_id"], None)
     elif kind == "tools_completed":
-        for call in state["assistant"]["content"]:
+        for index, call in enumerate(state["assistant"]["content"]):
             if call["type"] == "toolCall":
                 item = state["results"][call["id"]]
                 message = tool_message(call, item["result"], item["time"])
-                state["messages"].append(message)
+                append_messages(state, [message], record, f"tool-{index}")
                 state["run_messages"].append(message)
         state["phase"] = "finish_turn"
     elif kind == "turn_completed":
@@ -243,7 +248,20 @@ def reduce_record(state, record):
         state.update(status="running", error=None)
     elif kind == "history_reset":
         state.clear()
-        state.update(empty_state(), messages=data["messages"])
+        state.update(empty_state())
+        replace_messages(state, data["messages"], record, "messages")
+    elif kind == "compaction":
+        apply_compaction(state, record)
+        state["compaction_attempt"] = None
+    elif kind == "compaction_started":
+        state["compaction_attempt"] = deepcopy(data)
+    elif kind == "compaction_failed":
+        state["compaction_attempt"] = None
+    elif kind == "context_replaced":
+        replace_messages(state, data["messages"], record, "messages")
+        state["compaction"] = None
+    elif kind == "session_forked":
+        state["origin"] = deepcopy(data)
     else:
         raise SessionError(f"Unknown required session record: {kind}")
 
@@ -277,6 +295,67 @@ class Session(ABC):
     def restored_model(self):
         return restore_model(self._state["model"]) if self._state["model"] else None
 
+    def build_context(self, event_id=None):
+        """Derive model-visible messages at the current or a historical journal boundary."""
+        state = self.snapshot if event_id is None else self.snapshot_at(event_id)
+        return state["messages"]
+
+    def context_entries(self):
+        return [
+            {"message_id": key, "event_id": key.split("/", 1)[0], "message": deepcopy(message)}
+            for key, message in zip(self._state["message_ids"], self._state["messages"])
+        ]
+
+    def _prefix(self, event_id):
+        records = self.read_records()
+        for index, record in enumerate(records):
+            if record["id"] == event_id:
+                return records[: index + 1]
+        raise SessionError(f"Unknown event ID: {event_id}")
+
+    def snapshot_at(self, event_id):
+        return replay_records(self._prefix(event_id))
+
+    async def fork_into(self, event_id, target):
+        """Copy a complete prefix into an empty independent Session, preserving checkpoints."""
+        if target is self or target.session_id == self.session_id:
+            raise SessionError("Fork needs a different session ID")
+        records = self._prefix(event_id)
+        records.append(
+            {
+                "id": uuid4().hex,
+                "seq": len(records),
+                "type": "session_forked",
+                "time": timestamp(),
+                "run_id": records[-1].get("run_id"),
+                "data": {"parent_session_id": self.session_id, "parent_event_id": event_id},
+            }
+        )
+        state = replay_records(records)
+        await target.acquire()
+        try:
+            if target.revision:
+                raise SessionError("Fork target must be empty")
+            task = asyncio.create_task(target._import_records(records))
+            cancelled = False
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            task.result()
+            target._state, target._seq = state, len(records)
+            if cancelled:
+                raise asyncio.CancelledError
+        except Exception as error:
+            if isinstance(error, SessionError):
+                raise
+            target._failed = True
+            raise SessionError(f"Fork journal publication failed: {error}") from error
+        finally:
+            await target.release()
+        return target
+
     async def acquire(self):
         if self._busy:
             raise SessionBusyError("Session already has an active writer")
@@ -303,6 +382,7 @@ class Session(ABC):
                 record = json.loads(
                     json.dumps(
                         {
+                            "id": uuid4().hex,
                             "type": kind,
                             "seq": self._seq,
                             "data": data,
@@ -333,6 +413,21 @@ class Session(ABC):
             self._state, self._seq = candidate, self._seq + 1
             if cancelled:
                 raise asyncio.CancelledError
+            return deepcopy(record)
+
+    async def sync_context(self, messages):
+        if messages != self._state["messages"]:
+            await self.commit("context_replaced", messages=messages)
+
+    async def compact(self, summary, first_kept_message_id, *, tokens_before=0, details=None):
+        """Append a compaction under the active writer; old records remain untouched."""
+        return await self.commit(
+            "compaction",
+            summary=summary,
+            first_kept_message_id=first_kept_message_id,
+            tokens_before=tokens_before,
+            details=details,
+        )
 
     async def begin(self, context, inputs, config):
         if self.resumable:
@@ -484,7 +579,26 @@ class Session(ABC):
     async def _persist(self, seq, record): ...
 
     @abstractmethod
+    def read_records(self, after_seq=-1): ...
+
+    async def _import_records(self, records):
+        raise NotImplementedError("This backend does not implement atomic journal import")
+
+    @abstractmethod
     async def _acquire(self): ...
 
     @abstractmethod
     async def _release(self): ...
+
+
+def replay_records(records):
+    state, seen = empty_state(), set()
+    for seq, record in enumerate(records):
+        if record["seq"] != seq or record["id"] in seen:
+            raise SessionError("Invalid event sequence or duplicate event ID")
+        seen.add(record["id"])
+        try:
+            reduce_record(state, deepcopy(record))
+        except (ValueError, KeyError, TypeError) as error:
+            raise SessionError(f"Invalid journal event {record['id']}: {error}") from error
+    return state

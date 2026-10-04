@@ -7,9 +7,12 @@ import hashlib
 import json
 import os
 import re
+import tempfile
+from copy import deepcopy
 from pathlib import Path
+from uuid import NAMESPACE_URL, uuid5
 
-from .base import Session, SessionBusyError, SessionError, empty_state, reduce_record
+from .base import Session, SessionBusyError, SessionError, replay_records
 
 try:
     import fcntl
@@ -60,7 +63,16 @@ class LocalSession(Session):
                     raise ValueError("Non-contiguous event sequence")
                 if hashlib.sha256(encode(envelope)).hexdigest() != checksum:
                     raise ValueError("Checksum mismatch")
-                records.append(envelope["record"])
+                record = envelope["record"]
+                if record["seq"] != seq:
+                    raise ValueError("Record/envelope sequence mismatch")
+                # Existing logs gain stable IDs without changing any stored bytes/checksums.
+                record.setdefault(
+                    "id", uuid5(NAMESPACE_URL, f"agent-runtime:{self.session_id}:{seq}").hex
+                )
+                if not isinstance(record["id"], str) or not record["id"] or "/" in record["id"]:
+                    raise ValueError("Invalid event ID")
+                records.append(record)
             except (TypeError, ValueError, KeyError) as error:
                 raise SessionError(f"Corrupt session record {seq}: {error}") from error
         return records, raw, boundary
@@ -68,10 +80,8 @@ class LocalSession(Session):
     def _reload(self, repair=False):
         if self.path is None:
             return
-        state = empty_state()
         records, raw, boundary = self._read_file()
-        for record in records:
-            reduce_record(state, record)
+        state = replay_records(records)
         if repair and boundary != len(raw):
             with self.path.open("r+b") as file:
                 file.truncate(boundary)
@@ -87,6 +97,48 @@ class LocalSession(Session):
             return json.loads(json.dumps(self._records[after_seq + 1 :]))
         records, _, _ = self._read_file()
         return records[after_seq + 1 :]
+
+    async def fork(self, event_id, *, session_id=None):
+        """Create an independent session with the complete journal through event_id."""
+        target = LocalSession(
+            session_id, self.directory.parent if self.directory is not None else None
+        )
+        return await self.fork_into(event_id, target)
+
+    async def _import_records(self, records):
+        if self.path is None:
+            self._records = deepcopy(records)
+            return
+
+        def write():
+            # Publish the whole prefix at once. A crash cannot expose half a fork.
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=self.directory, delete=False) as file:
+                    temporary = Path(file.name)
+                    for seq, record in enumerate(records):
+                        envelope = {
+                            "format": 1,
+                            "session_id": self.session_id,
+                            "seq": seq,
+                            "record": record,
+                        }
+                        envelope["checksum"] = hashlib.sha256(encode(envelope)).hexdigest()
+                        file.write(encode(envelope) + b"\n")
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(temporary, self.path)
+                for directory in (self.directory, self.directory.parent):
+                    descriptor = os.open(directory, os.O_RDONLY)
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+
+        await asyncio.to_thread(write)
 
     async def _acquire(self):
         if self.directory is None:

@@ -2,7 +2,7 @@
 
 ## 默认行为
 
-`Agent(model="deployment-name")` 默认使用 OpenAI provider 和 Responses API；`Agent()` 从 `AGENT_MODEL` 读取模型名。没有配置模型名时在启动前报错。
+`Agent()` 默认使用 OpenAI provider、Responses API 和 `gpt-6-luna`。非空的 `AGENT_MODEL` 或显式 `model` 可以覆盖默认模型；不会在失败后自动回退到其他模型。
 
 `RuntimeConfig.from_env()` 读取进程环境，`Models` 在构造时保存配置快照，不在各租户请求中修改 `os.environ`。`Models(env={})` 禁用环境继承；`Models(env=mapping)` 使用调用方给定的配置来源。
 
@@ -13,7 +13,7 @@
 | 变量 | 默认值 | 用途 |
 | --- | --- | --- |
 | `AGENT_PROVIDER` | openai | 默认 provider |
-| `AGENT_MODEL` | 无 | 模型／部署名，调用时也可显式传入 |
+| `AGENT_MODEL` | gpt-6-luna | 模型／部署名，调用时也可显式传入 |
 | `AGENT_API` | provider 默认协议 | openai 默认 openai-responses；anthropic 默认 anthropic-messages |
 | `OPENAI_API_KEY` | 无 | OpenAI / openai-chat 凭据 |
 | `OPENAI_BASE_URL` | https://api.openai.com/v1 | 包含 /v1 的 API 根路径 |
@@ -25,6 +25,8 @@
 | `AGENT_REASONING` | provider 默认值 | 统一 reasoning 等级 |
 
 未知模型的 4096 是 SDK 的初始输出预算，不是推测的模型能力；需要更大预算时注册准确的 `Model.max_tokens`。空字符串按未设置处理。配置数值或 URL 格式错误时直接报错，不静默使用意外地址。
+
+内置 `gpt-6-luna` 元数据依据 [官方模型页](https://developers.openai.com/api/docs/models/gpt-6-luna) 和 [参数兼容说明](https://developers.openai.com/api/docs/guides/latest-model)：支持 `none/low/medium/high/xhigh/max` reasoning，`minimal` 调整为 `low`；默认 reasoning 为 `medium`，非 `none` 时丢弃 `temperature` 和 `top_p`。这些规则仍由通用元数据处理，没有模型名分支。应用可用 `max_tokens` 设置小于模型上限的输出预算。
 
 模板显式设置了 `AGENT_API=openai-responses`。切换到 Anthropic 时应同时修改或清空该项；显式 API 配置不会根据 provider 自动改写。
 

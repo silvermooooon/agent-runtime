@@ -9,6 +9,7 @@ from .agent_loop import (
     run_tool_call,
 )
 from .ai import Models, normalize_parameters
+from .compaction import CompactionPlan, CompactionSettings, Compactor
 from .config import ProviderConfig, RuntimeConfig
 from .event_stream import AssistantMessageEventStream, EventStream
 from .proxy import stream_proxy
