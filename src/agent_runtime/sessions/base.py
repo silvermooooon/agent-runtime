@@ -297,8 +297,9 @@ class Session(ABC):
 
     def build_context(self, event_id=None):
         """Derive model-visible messages at the current or a historical journal boundary."""
-        state = self.snapshot if event_id is None else self.snapshot_at(event_id)
-        return state["messages"]
+        if event_id is None:
+            return deepcopy(self._state["messages"])
+        return self.snapshot_at(event_id)["messages"]
 
     def context_entries(self):
         return [
@@ -368,16 +369,31 @@ class Session(ABC):
             raise
 
     async def release(self):
-        try:
-            await self._release()
-        finally:
-            self._busy = False
-            self.live.clear()
+        # Wait for already queued commits before releasing writer ownership. Repeated
+        # cancellation must not abandon a release that is waiting for a durable write.
+        async def finish():
+            async with self._commit_lock:
+                try:
+                    await self._release()
+                finally:
+                    self._busy = False
+                    self.live.clear()
+
+        task = asyncio.create_task(finish())
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def commit(self, kind, **data):
-        if not self._busy or self._failed:
-            raise SessionError("Session needs an active, healthy writer")
         async with self._commit_lock:
+            if not self._busy or self._failed:
+                raise SessionError("Session needs an active, healthy writer")
             try:
                 record = json.loads(
                     json.dumps(
@@ -393,7 +409,12 @@ class Session(ABC):
                         allow_nan=False,
                     )
                 )
-                candidate = deepcopy(self._state)
+                # Reducers replace nested values, and only mutate top-level containers.
+                # Copy those containers without copying the full message/result history.
+                candidate = {
+                    key: value.copy() if isinstance(value, (list, dict)) else value
+                    for key, value in self._state.items()
+                }
                 reduce_record(candidate, record)
             except (TypeError, ValueError, KeyError) as error:
                 raise SessionError(f"Invalid session record {kind}: {error}") from error
@@ -514,6 +535,9 @@ class Session(ABC):
 
     async def tool_started(self, call, args):
         await self.commit("tool_started", call_id=call["id"], args=args, time=timestamp())
+
+    def started_call(self, call_id):
+        return deepcopy(self._state["started"].get(call_id))
 
     def returned_result(self, call_id):
         item = self._state["returned"].get(call_id)

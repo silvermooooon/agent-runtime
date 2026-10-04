@@ -15,7 +15,7 @@ uv run --env-file .env python tests/live_openai.py --live
 3. 模型的完整工具计划落盘后停止，在新进程恢复，复用原工具调用身份，只发起获取最终回复的请求。
 4. 首个文本增量后停止，在新进程从保存的模型请求重新执行；不要求恢复同一次服务端生成。
 
-每次请求限制为 512 个输出 token、20 秒网络操作超时，每个阶段最多 3 次请求，子进程最多运行 60 秒。正常完整执行预计 8 次请求；任一阶段失败立即停止，不自动重试。恢复测试是主动取消后跨进程重新启动；强制进程退出由离线 Session 测试覆盖。
+每次请求限制为 512 个输出 token、20 秒网络操作超时，每个阶段最多 3 次请求，子进程最多运行 60 秒。正常完整执行预计 7 次请求；任一阶段失败立即停止，不自动重试。恢复测试是主动取消后跨进程重新启动；强制进程退出由离线 Session 测试覆盖。
 
 测试输出阶段结果、模型、HTTP 状态、request ID、事件计数和 token 用量，不输出 API key 或请求头。Session 存在临时目录，测试后自动清理。运行前需由宿主加载 `.env`；SDK 本身不会搜索文件。
 
@@ -23,7 +23,7 @@ uv run --env-file .env python tests/live_openai.py --live
 
 ## 2026-10-04 实测通过
 
-调整当前任务的执行权限后，通过项目 `.env` 中的 `HTTPS_PROXY=http://127.0.0.1:7890` 重新运行上述命令。没有修改系统代理设置。六个阶段全部通过，共 8 次真实请求，均为官方 Responses API、`gpt-6-luna`、HTTP 200；未使用 MockTransport、FakeProvider 或其他模型。
+调整当前任务的执行权限后，通过项目 `.env` 中的 `HTTPS_PROXY=http://127.0.0.1:7890` 重新运行上述命令。没有修改系统代理设置。六个阶段全部通过，共 7 次真实请求，均为官方 Responses API、`gpt-6-luna`、HTTP 200；未使用 MockTransport、FakeProvider 或其他模型。
 
 | 阶段 | 请求数 | 文本增量数 | 工具执行数 | Session 状态 |
 | --- | --- | --- | --- | --- |
@@ -49,6 +49,22 @@ stream-resume: req_2529ca9b80f84794b2cdc27fbe593368
 ```
 
 此次测试参数为 `reasoning=none`、每次请求 `max_tokens=512`。它确认这些具体场景的真实连通性和恢复行为，不覆盖所有参数组合、模型能力或并发故障。被取消的流未收到终态 usage，不能通过 SDK 返回的 usage 汇总得到完整计费量。
+
+## 2026-10-05 生命周期与流式修复后回归
+
+再次运行 `tests/live_openai.py --live`，六个阶段全部通过，共 7 次官方 Responses 请求，固定 `gpt-6-luna`，全部 HTTP 200。覆盖文本、工具循环、工具计划停止后跨进程恢复，以及文本流停止后重新请求。停止后的工具计划只执行一次工具；流恢复后完整输出 1 至 100。
+
+```text
+text:          req_a04ac9d600524e7a8902dca3b911e83c
+tools:         req_48d4c4c7221a49d5a20ad19cf473ebfc
+               req_eb029cf3356d4899a021ce77bbd8d7ac
+plan-start:    req_80702c35c5094fea94519a3ca07f916e
+plan-resume:   req_90c2ad9b41b042288fbab7610bcce9a5
+stream-start:  req_1cd4eb85eade44c1971801336ce27e44
+stream-resume: req_27f9e2cd249146108dfeb7804949d05d
+```
+
+同版本离线测试 201 项通过，其中新增 13 项覆盖写入权释放竞争、持久化失败、重复取消、流式背压、增量日志读取和完整输出文件保留。慢速消费及文件故障由可控的离线测试验证，不以本次在线成功替代故障覆盖。Ruff 检查及 wheel／sdist 构建通过。
 
 ## 2026-10-04 内置四工具实测通过
 
@@ -114,4 +130,22 @@ uv run --env-file .env python tests/live_mcp.py --live
 ```text
 req_3aa14a64f226462fa23203e57ed786ed
 req_eb0f025d39b742bf91577932b131fde8
+```
+
+## 2026-10-05 Skill 加载实测通过
+
+独立入口：
+
+```bash
+uv run --env-file .env python tests/live_skills.py --live
+```
+
+固定官方 Responses API 和 `gpt-6-luna`，最多 3 次请求，每次最多 512 输出 token、20 秒网络操作超时，Agent 运行上限 90 秒。使用临时 Skill 目录和 Session，Skill 存储通过 `AGENT_SKILLS_DIR` 配置接口注入该目录；模型凭据和代理从项目 `.env` 加载。
+
+本次 3 次真实请求均为 HTTP 200。模型依次调用 `load_skill`、`load_skill_reference`，然后按参考文本返回 `skill-runtime-ok`。两个完整工具返回值均已写入 Session，最终状态为 `completed`；没有使用模拟模型或通用 read 工具。目录配置、替换后端、审批、并发、取消、路径边界和源文件变更后的恢复由离线测试覆盖。
+
+```text
+req_848e8bc9cbea47f9a254cae595c44080
+req_0379820137d64622b2f840fa0e3643d0
+req_296741cefca94a2ebb92bc5be8a858af
 ```

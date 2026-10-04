@@ -61,6 +61,7 @@ uv run --env-file .env python tests/live_openai.py --live
 - `agent_loop` / `run_agent_loop`：流式或可等待事件 sink 的低层入口。
 - 工具 JSON Schema 校验、参数准备、执行前后钩子、串行／并行执行。
 - 显式装配 MCP 工具：HTTP/stdio 调用、动态请求头、已有工具审批和恢复流程。
+- 专用 `load_skill` / `load_skill_reference` 工具、可替换 SkillStore 和本地目录发现。
 - `finish_turn`、`prepare_request`、`prepare_next_turn`、上下文转换与动态 API key。
 - 三种 HTTP SSE 协议：OpenAI Responses、OpenAI Chat Completions、Anthropic Messages。
 - provider/model 注册、API 实现注入、参数过滤与模型限制处理。
@@ -146,6 +147,27 @@ tool = AgentTool(
 `on_update(partial_result)` 是同步调度回调，结算时会等待已发送更新；工具返回后再调用它不会继续发事件。
 普通工具错误成为 `isError` 结果传给模型；MCP 调用结果未知时暂停核实，不自动重试。被 token 上限截断的工具调用不会执行。
 
+## Skill
+
+`agent_runtime.skills` 提供专用 Skill 加载工具，默认通过 `AGENT_SKILLS_DIR` 指定的本地目录读取。目录发现返回名称和描述，正文及参考内容在调用工具时加载；后续可继承 `SkillStore` 替换为 DB/S3 存储。
+
+```python
+from agent_runtime.skills import LocalSkillStore, create_skill_tools
+
+store = LocalSkillStore()  # .env 中配置 AGENT_SKILLS_DIR，由宿主加载到进程环境
+catalog = await store.discover()  # 外层筛选候选目录并交给模型
+prompt = "可用 Skill，执行任务前按需加载：\n" + "\n".join(
+    f"- {item.name}: {item.description}" for item in catalog
+)
+agent = Agent(tools=create_skill_tools(store=store), system_prompt=prompt)
+```
+
+完整装配、两个工具的调用参数和恢复行为见 [Skill 加载](docs/skills.md)。离线示例：
+
+```bash
+AGENT_SKILLS_DIR=examples/skill_catalog uv run python examples/skills.py
+```
+
 ## Session 与恢复
 
 `Agent()` 默认使用 `LocalSession`，自动分配 session ID，记录写入 `.agent-runtime/sessions/<id>/events.jsonl`。
@@ -226,7 +248,11 @@ uv run python examples/session_projection.py
 `subscribe` 回调按注册顺序等待，`agent_end` 的回调也完成后才进入 idle。
 Session 保存和恢复由 Runtime 直接调用，不依赖事件订阅。`message_update` 可用于向独立 UI 缓冲区投递增量，完整事件可用于额外审计。UI 投递失败应由调用方隔离处理；Session 保存失败会抛出 `SessionError` 并停止推进。
 
-低层 `run_agent_loop(..., emit=...)` 直接等待 sink，并向调用方传播 sink 失败；流式 `agent_loop` 使用内存队列，不能视为持久化队列，也不适合永远不消费的订阅。
+低层 `run_agent_loop(..., emit=...)` 直接等待 sink，并向调用方传播 sink 失败。流式 `agent_loop`、内置模型 adapter 和 proxy 使用有容量限制的内存队列，消费落后时暂停生产，保留事件顺序。它不是持久化队列。
+
+需要事件和最终结果时，先 `async for event in stream`，再 `await stream.result()`；只需要结果时直接 `await stream.result()`，会丢弃尚未消费的中间事件。不要一边迭代一边提前调用 `result()`。持续生产事件的自定义 adapter 使用 `await stream.send(event)`；同步 `push()` 只适用于已经限制大小的批次。
+
+队列默认阈值为 64 个事件；模型／proxy 在读取每个协议事件后、解析前等待容量，单次解析及终态事件可以短暂超过阈值。前端 SSE 应由外层独立任务消费自己的缓冲区，`subscribe` 只做快速投递并隔离连接错误。缓冲区满时可按此前约定放弃打字机增量、等待完整结果；不要让 SDK 回调等待断开的前端。
 
 前端断开不应取消后台 `agent.prompt()` 所属任务。用户停止时调用 `agent.abort()`；模型网络请求会被中断，工具通过 signal 协作退出。Python 任务本身被取消时，取消会继续向上传播。
 

@@ -51,6 +51,22 @@ uv run --env-file .env python examples/coding_tools.py /workspace/project '检�
 
 `bash` 非零退出码会成为 `isError` 工具结果。`structuredContent` 包含退出码、耗时、最多 1 MiB 的头尾输出。超时和取消时，本地 POSIX 后端终止进程组；Windows 默认后端仅终止直接子进程，尚未验证 Windows 行为。命令退出后仍被后台子进程占用的输出管道有 100ms 空闲收尾窗口。完整输出文件不会自动删除，宿主负责按保留策略清理 `fullOutputPath`。
 
+完整输出默认放在系统临时目录。需要与会话一起保留时，显式指定 `output_dir`：
+
+```python
+from agent_runtime import Agent, LocalSession
+from agent_runtime.tools import create_coding_tools
+
+session = LocalSession("conversation-123", directory="./sessions")
+tools = create_coding_tools(
+    cwd="/workspace/project",
+    bash_options={"output_dir": session.directory / "outputs"},
+)
+agent = Agent(session=session, tools=tools)
+```
+
+指定目录后，截断产生的完整输出文件会在工具返回前执行 `flush` / `fsync`，并同步目录项；这一保证面向 POSIX 本地文件系统。Session 记录仍保存有界输出及完整文件路径，超大内容不会重复塞入日志。宿主需保留这些文件并保证恢复时路径可访问；会话分叉复制日志，不复制引用的输出文件，因此清理父会话时需保留仍被引用的文件。尚未完成的命令输出不作为可恢复的工具结果。
+
 ## 配置和替换后端
 
 工厂选项由宿主传入，不交给模型修改：

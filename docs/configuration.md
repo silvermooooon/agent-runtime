@@ -23,6 +23,7 @@
 | `AGENT_MAX_TOKENS` | 已知模型上限；未知模型 4096 | 请求输出预算，仍会受模型元数据约束 |
 | `AGENT_TEMPERATURE` | 不发送 | 温度参数，仍经过兼容过滤 |
 | `AGENT_REASONING` | provider 默认值 | 统一 reasoning 等级 |
+| `AGENT_SKILLS_DIR` | 无 | 显式装配 LocalSkillStore/Skill 工具时使用的本地目录；模板示例为 ./skills |
 
 未知模型的 4096 是 SDK 的初始输出预算，不是推测的模型能力；需要更大预算时注册准确的 `Model.max_tokens`。空字符串按未设置处理。配置数值或 URL 格式错误时直接报错，不静默使用意外地址。
 
@@ -61,3 +62,7 @@ agent = Agent(models=models, provider="tenant-a", model="deployment-name")
 Session 不读取新的环境变量，存储路径由宿主显式配置；`directory=None` 为该组件内的纯内存模式。
 已存在的 Session 优先恢复其模型配置，API Key 和 transport headers 仍由当前进程重新注入。
 详见 [Session 生命周期与恢复](sessions.md)。
+
+## Skill 存储位置
+
+`LocalSkillStore()`、`create_skill_tools()` 从 `AGENT_SKILLS_DIR` 获取本地目录。显式 `directory` 优先；传入自定义 `store` 时不读取本地存储配置。`Agent()` 不会因设置了这个环境变量就自动启用工具。目录布局、专用加载工具和后端替换见 [Skill 加载](skills.md)。

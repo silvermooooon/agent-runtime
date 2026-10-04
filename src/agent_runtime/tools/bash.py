@@ -152,6 +152,7 @@ def create_bash_tool(
     command_prefix: str | None = None,
     shell_path: str | None = None,
     spawn_hook=None,
+    output_dir: str | Path | None = None,
 ) -> AgentTool:
     cwd = str(Path(cwd).expanduser().absolute())
     ops = operations if operations is not None else LocalBashOperations(shell_path)
@@ -186,7 +187,7 @@ def create_bash_tool(
         if spawn_hook:
             context = await maybe_await(spawn_hook(context))
         signal.throw_if_aborted()
-        output = OutputAccumulator()
+        output = OutputAccumulator(output_dir=output_dir)
         started = time.monotonic()
         last_update = 0
         accepting = True

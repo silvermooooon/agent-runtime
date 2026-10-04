@@ -185,6 +185,8 @@ class Models:
                 )
                 async with aclosing(events):
                     async for event in events:
+                        # Apply backpressure before a provider frame creates full snapshots.
+                        await stream.wait_for_capacity()
                         if options.get("on_provider_stream_event"):
                             await maybe_await(
                                 options["on_provider_stream_event"](deepcopy(event), model)
@@ -218,9 +220,6 @@ class Models:
 
     async def complete_simple(self, model, context, options=None):
         stream = await maybe_await(self.stream_simple(model, context, options))
-        # Consume to avoid accumulating all delta snapshots when only a result is wanted.
-        async for _ in stream:
-            pass
         return await stream.result()
 
 

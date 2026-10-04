@@ -1,6 +1,7 @@
 """Bounded streaming UTF-8 tail and lazy full-output spool, ported from pi."""
 
 import codecs
+import os
 import tempfile
 from pathlib import Path
 
@@ -8,7 +9,10 @@ from ._truncate import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate
 
 
 class OutputAccumulator:
-    def __init__(self):
+    def __init__(self, output_dir=None):
+        self.output_dir = (
+            Path(output_dir).expanduser().resolve() if output_dir is not None else None
+        )
         self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.raw = bytearray()
         self.tail = ""
@@ -46,8 +50,10 @@ class OutputAccumulator:
     def _spool(self):
         if self.path is not None:
             return
+        if self.output_dir is not None:
+            self.output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.file = tempfile.NamedTemporaryFile(
-            prefix="agent-runtime-bash-", suffix=".log", delete=False
+            prefix="agent-runtime-bash-", suffix=".log", delete=False, dir=self.output_dir
         )
         self.path = self.file.name
         self.file.write(self.raw)
@@ -96,8 +102,20 @@ class OutputAccumulator:
 
     def close(self):
         if self.file is not None:
-            self.file.close()
-            self.file = None
+            try:
+                if self.output_dir is not None:
+                    self.file.flush()
+                    os.fsync(self.file.fileno())
+                    # Persist newly created directory entries up through the output root.
+                    for directory in (self.output_dir, *self.output_dir.parents):
+                        descriptor = os.open(directory, os.O_RDONLY)
+                        try:
+                            os.fsync(descriptor)
+                        finally:
+                            os.close(descriptor)
+            finally:
+                self.file.close()
+                self.file = None
 
     def full_output(self, max_bytes=1024 * 1024):
         if self.path is None:

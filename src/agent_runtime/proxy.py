@@ -107,6 +107,7 @@ def stream_proxy(model, context, options, *, client=None):
             )
             async with aclosing(events):
                 async for event in events:
+                    await stream.wait_for_capacity()
                     converted = process_proxy_event(event, partial, buffers)
                     stream.push(converted)
                     if converted["type"] in ("done", "error"):

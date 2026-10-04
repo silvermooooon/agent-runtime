@@ -47,42 +47,67 @@ class LocalSession(Session):
         self.durable = self.path is not None
         self._writer = None
         self._records = []
+        self._read_cursor = None
         self._reload()
 
-    def _read_file(self):
-        raw = self.path.read_bytes() if self.path and self.path.exists() else b""
-        boundary = raw.rfind(b"\n") + 1
-        records = []
-        for seq, line in enumerate(raw[:boundary].splitlines()):
-            try:
-                envelope = json.loads(line)
-                checksum = envelope.pop("checksum")
-                if envelope["format"] != 1 or envelope["session_id"] != self.session_id:
-                    raise ValueError("Unsupported format or session identity")
-                if envelope["seq"] != seq:
-                    raise ValueError("Non-contiguous event sequence")
-                if hashlib.sha256(encode(envelope)).hexdigest() != checksum:
-                    raise ValueError("Checksum mismatch")
-                record = envelope["record"]
-                if record["seq"] != seq:
-                    raise ValueError("Record/envelope sequence mismatch")
-                # Existing logs gain stable IDs without changing any stored bytes/checksums.
-                record.setdefault(
-                    "id", uuid5(NAMESPACE_URL, f"agent-runtime:{self.session_id}:{seq}").hex
-                )
-                if not isinstance(record["id"], str) or not record["id"] or "/" in record["id"]:
-                    raise ValueError("Invalid event ID")
-                records.append(record)
-            except (TypeError, ValueError, KeyError) as error:
-                raise SessionError(f"Corrupt session record {seq}: {error}") from error
-        return records, raw, boundary
+    def _read_file(self, after_seq=-1):
+        if self.path is None or not self.path.exists():
+            self._read_cursor = None
+            return [], 0, 0
+        records, seq, boundary = [], 0, 0
+        with self.path.open("rb") as file:
+            stat = os.fstat(file.fileno())
+            identity = (stat.st_dev, stat.st_ino)
+            cursor = self._read_cursor
+            # Journals are append-only. A cursor accelerates forward polling; full
+            # history, reopen, replacement and truncation still validate the full log.
+            if cursor and after_seq >= 0:
+                previous_id, size, modified, count, offset = cursor
+                if (
+                    identity == previous_id
+                    and after_seq >= count - 1
+                    and (
+                        stat.st_size > size
+                        or (stat.st_size == size and stat.st_mtime_ns == modified)
+                    )
+                ):
+                    seq, boundary = count, offset
+                    file.seek(offset)
+            for line in file:
+                if not line.endswith(b"\n"):
+                    break  # An incomplete tail will be reread on the next poll.
+                try:
+                    envelope = json.loads(line)
+                    checksum = envelope.pop("checksum")
+                    if envelope["format"] != 1 or envelope["session_id"] != self.session_id:
+                        raise ValueError("Unsupported format or session identity")
+                    if envelope["seq"] != seq:
+                        raise ValueError("Non-contiguous event sequence")
+                    if hashlib.sha256(encode(envelope)).hexdigest() != checksum:
+                        raise ValueError("Checksum mismatch")
+                    record = envelope["record"]
+                    if record["seq"] != seq:
+                        raise ValueError("Record/envelope sequence mismatch")
+                    record.setdefault(
+                        "id", uuid5(NAMESPACE_URL, f"agent-runtime:{self.session_id}:{seq}").hex
+                    )
+                    if not isinstance(record["id"], str) or not record["id"] or "/" in record["id"]:
+                        raise ValueError("Invalid event ID")
+                    if seq > after_seq:
+                        records.append(record)
+                except (TypeError, ValueError, KeyError) as error:
+                    raise SessionError(f"Corrupt session record {seq}: {error}") from error
+                seq += 1
+                boundary = file.tell()
+            self._read_cursor = (identity, stat.st_size, stat.st_mtime_ns, seq, boundary)
+        return records, stat.st_size, boundary
 
     def _reload(self, repair=False):
         if self.path is None:
             return
-        records, raw, boundary = self._read_file()
+        records, size, boundary = self._read_file()
         state = replay_records(records)
-        if repair and boundary != len(raw):
+        if repair and boundary != size:
             with self.path.open("r+b") as file:
                 file.truncate(boundary)
                 file.flush()
@@ -95,8 +120,8 @@ class LocalSession(Session):
         """Read durable logical events. Live deltas are only available through `live`."""
         if self.path is None:
             return json.loads(json.dumps(self._records[after_seq + 1 :]))
-        records, _, _ = self._read_file()
-        return records[after_seq + 1 :]
+        records, _, _ = self._read_file(after_seq)
+        return records
 
     async def fork(self, event_id, *, session_id=None):
         """Create an independent session with the complete journal through event_id."""

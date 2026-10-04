@@ -71,6 +71,7 @@
 - 未移植 coding-agent 的 TUI renderer、提示词元数据注入和模型专用图片配置；常用使用说明放入工具 description，图片限制可通过工厂参数显式配置。本地 bash 的进程组取消测试覆盖 macOS/POSIX；Windows 未验证，Windows 默认后端只终止直接子进程。
 - MCP 协议收发复用官方 Python `mcp` 2.3 客户端，使用 `ClientSession.send_request` 避免高层 `call_tool` 隐式发现 schema。默认按次连接，平台提供已选 schema 和身份上下文；未移植 Pi 的发现、schema 缓存、OAuth、codemode、资源读取及截断管理。
 - MCP 的模型内容投影直接翻译上述 `toLlmContent`；完整结果另外保留在现有工具结果的 details 内。业务名称使用约定的 `server.tool`，在默认 AI 协议层转为 `server__tool` 后还原，没有移植 Pi 的 hash 命名和冲突处理。
+- Skill 按本项目需求使用 `load_skill` / `load_skill_reference` 专用工具及可继承的 `SkillStore`，没有移植 Pi 通过通用 read 工具读取 Skill 的方式。本地后端支持目录发现和 YAML 元数据，宿主负责提供候选目录，详见 [Skill 加载](skills.md)。
 
 ## 初版未移植范围
 
@@ -88,6 +89,7 @@
 
 核心测试场景参考上游 `packages/agent/test/agent.test.ts` 与 `agent-loop.test.ts`，覆盖事件顺序、队列、工具校验、串并行、取消和钩子。
 HTTP 测试使用 httpx MockTransport 注入 Responses、Completions、Anthropic、proxy SSE，验证实际请求体及流解析。参数测试使用合成模型元数据，不绑定特定新模型名称。
+Python 流增加有限队列和异步 `send`，内置 adapter 在协议事件之间等待容量；`result()` 明确采用只保留最终结果的消费方式。Session 释放复用提交锁，尾部查询只维护内存游标；bash 的 `output_dir` 复用现有完整输出文件机制。没有增加持久化队列、外部锁服务或附件管理组件。对应回归测试见 `tests/test_runtime_boundaries.py`。
 
 内置工具测试使用真实临时文件和本地 shell，覆盖分页、图片、批量编辑、并发修改、输出截断、超时、取消、审批及 Session 恢复；模型调度部分使用 FakeProvider。
 

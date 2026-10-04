@@ -316,9 +316,11 @@ class Agent:
             self.state.messages = self.session.build_context()
             self.state.is_streaming = False
             self.signal = None
-            await self.session.release()
-            self._session_revision = self.session.revision
-            self._idle.set()
+            try:
+                await self.session.release()
+            finally:
+                self._session_revision = self.session.revision
+                self._idle.set()
 
     async def _compact_before_request(self, context, model, options, signal):
         await self.session.sync_context(context.messages)
@@ -572,9 +574,11 @@ class Agent:
             self.state.streaming_message = None
             self.state.pending_tool_calls.clear()
             self.signal = None
-            await self.session.release()
-            self._session_revision = self.session.revision
-            self._idle.set()
+            try:
+                await self.session.release()
+            finally:
+                self._session_revision = self.session.revision
+                self._idle.set()
 
     async def reset_session(self):
         """Explicitly abandon pending work and append a reset; old audit records remain."""

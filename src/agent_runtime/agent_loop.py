@@ -76,8 +76,8 @@ async def run_agent_loop_resume(context, config, emit, signal=None, stream_fn=No
     if not config.session or not config.session.resumable:
         raise SessionError("No unfinished session run to resume")
     await config.session.commit("run_resumed")
-    current = AgentContext(config.session.snapshot["messages"], list(context.tools))
     state = config.session.snapshot
+    current = AgentContext(state["messages"], list(context.tools))
     messages = state["run_messages"]
     await maybe_await(emit({"type": "agent_start"}))
     await maybe_await(emit({"type": "turn_start"}))
@@ -98,7 +98,7 @@ def _start_stream(executor):
 
     async def run():
         try:
-            stream.end(await executor(stream.push))
+            stream.end(await executor(stream.send))
         except BaseException as error:
             stream.fail(error)
 
@@ -292,7 +292,9 @@ async def _stream_assistant(context, config, emit, signal, stream_fn, prepared_r
         )
     messages = context.messages
     if prepared_request:
-        llm_messages = prepared_request.get("llm_messages", config.session.snapshot["messages"])
+        llm_messages = prepared_request.get("llm_messages")
+        if llm_messages is None:
+            llm_messages = config.session.build_context()
     elif config.transform_context:
         messages = await _hook(config.transform_context, messages, signal)
         llm_messages = await _hook(config.convert_to_llm, messages)
@@ -367,7 +369,7 @@ async def _prepare_tool(context, assistant, call, config, signal):
         return None, None, _error_result(f"Tool {call['name']} not found")
     try:
         args = call["arguments"]
-        started = config.session.snapshot["started"].get(call["id"]) if config.session else None
+        started = config.session.started_call(call["id"]) if config.session else None
         if started:
             args = deepcopy(started["args"])
         elif tool.prepare_arguments:
