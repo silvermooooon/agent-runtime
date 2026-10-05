@@ -63,9 +63,7 @@ class ProjectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reopened.build_context(), agent.state.messages)
         self.assertEqual(reopened.snapshot["compaction"]["event_id"], event["id"])
         self.assertNotIn("messages", event["data"])
-        self.assertEqual(
-            {p.name for p in session.directory.iterdir()}, {"events.jsonl", "writer.lock"}
-        )
+        self.assertEqual({p.name for p in session.directory.iterdir()}, {"events.jsonl"})
         provider = FakeProvider(answer("next"))
         next_agent = Agent(session=reopened, tools=[add_tool()], stream_fn=provider)
         await next_agent.prompt("next request")
@@ -230,7 +228,7 @@ class ProjectionTests(unittest.IsolatedAsyncioTestCase):
         await started.wait()
         task.cancel()
         await asyncio.sleep(0)
-        self.assertTrue(agent.session._busy)
+        self.assertTrue(agent.state.is_streaming)
         finish.set()
         with self.assertRaises(asyncio.CancelledError):
             await task
@@ -283,7 +281,7 @@ class ProjectionTests(unittest.IsolatedAsyncioTestCase):
             tools=[tool],
             stream_fn=FakeProvider(answer(calls=[call()])),
         )
-        with self.assertRaises(BaseExceptionGroup):
+        with self.assertRaises(ProcessLost):
             await agent.prompt("work")
         node = agent.session.read_records()[-1]["id"]
         child = await agent.session.fork(node, session_id="pending")
@@ -339,19 +337,6 @@ class ProjectionTests(unittest.IsolatedAsyncioTestCase):
             await agent.compact(summary="skip")
         self.assertTrue(agent.session.resumable)
 
-    async def test_stale_agent_remains_rejected_after_compaction_attempt(self):
-        agent = await self.history()
-        stale = Agent(session=self.session(), stream_fn=FakeProvider(answer()))
-        old_messages = stale.state.messages.copy()
-        await agent.compact(summary="another writer changed this session")
-        for _ in range(2):
-            with self.assertRaisesRegex(SessionError, "Session changed"):
-                await stale.compact(summary="stale summary")
-        with self.assertRaisesRegex(SessionError, "Session changed"):
-            await stale.prompt("stale input")
-        self.assertEqual(stale.state.messages, old_messages)
-        self.assertFalse(stale.state.is_streaming)
-
     async def test_manual_compaction_uses_current_thinking_level(self):
         agent = await self.history(thinking_level="low")
         agent.compactor = Compactor(CompactionSettings(keep_recent_tokens=0))
@@ -371,11 +356,7 @@ class ProjectionTests(unittest.IsolatedAsyncioTestCase):
         messages = agent.session.build_context()
         index = next(i for i, m in enumerate(messages) if m["role"] == "toolResult")
         messages.insert(index, {"role": "system", "content": "extra rules", "timestamp": 0})
-        await agent.session.acquire()
-        try:
-            await agent.session.sync_context(messages)
-        finally:
-            await agent.session.release()
+        await agent.session.sync_context(messages)
         reopened = Agent(session=self.session(), stream_fn=FakeProvider())
         boundary = reopened.session.context_entries()[index]["message_id"]
         with self.assertRaisesRegex(ValueError, "tool results"):

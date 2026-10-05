@@ -440,7 +440,7 @@ class CodingToolTests(unittest.IsolatedAsyncioTestCase):
             session=LocalSession("lost", session_dir),
             tools=[create_write_tool(self.directory, operations=CrashOperations())],
         )
-        with self.assertRaises(BaseExceptionGroup):
+        with self.assertRaises(ProcessLost):
             await agent.prompt("write")
         restored = Agent(
             session=LocalSession("lost", session_dir),

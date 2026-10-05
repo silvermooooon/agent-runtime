@@ -12,12 +12,7 @@ from copy import deepcopy
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-from .base import Session, SessionBusyError, SessionError, replay_records
-
-try:
-    import fcntl
-except ImportError:  # Package remains importable; file-backed ownership needs POSIX.
-    fcntl = None
+from .base import Session, SessionError, replay_records
 
 
 def encode(value):
@@ -29,9 +24,8 @@ def encode(value):
 class LocalSession(Session):
     """directory=None keeps everything in-process; the default directory enables persistence.
 
-    File-backed sessions have one nonblocking OS writer guard per session, released after each
-    Agent run and automatically on process death. This is local-filesystem ownership, not a
-    cluster lease; network filesystems and multiple hosts require a future backend/coordinator.
+    The host guarantees one execution per session and reopens it on worker handoff.
+    Journal reads do not change the file; the next append repairs an incomplete tail.
     """
 
     def __init__(self, session_id=None, directory=".agent-runtime/sessions"):
@@ -45,7 +39,7 @@ class LocalSession(Session):
         self.directory = Path(directory) / self.session_id if directory is not None else None
         self.path = self.directory / "events.jsonl" if self.directory is not None else None
         self.durable = self.path is not None
-        self._writer = None
+        self._tail_boundary = None
         self._records = []
         self._read_cursor = None
         self._reload()
@@ -102,16 +96,12 @@ class LocalSession(Session):
             self._read_cursor = (identity, stat.st_size, stat.st_mtime_ns, seq, boundary)
         return records, stat.st_size, boundary
 
-    def _reload(self, repair=False):
+    def _reload(self):
         if self.path is None:
             return
         records, size, boundary = self._read_file()
         state = replay_records(records)
-        if repair and boundary != size:
-            with self.path.open("r+b") as file:
-                file.truncate(boundary)
-                file.flush()
-                os.fsync(file.fileno())
+        self._tail_boundary = boundary if boundary != size else None
         self._state, self._seq = state, len(records)
         # File-backed sessions retain the projection, not a duplicate full event log in RAM.
         self._records = []
@@ -136,6 +126,7 @@ class LocalSession(Session):
             return
 
         def write():
+            self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             # Publish the whole prefix at once. A crash cannot expose half a fork.
             temporary = None
             try:
@@ -164,30 +155,7 @@ class LocalSession(Session):
                     temporary.unlink(missing_ok=True)
 
         await asyncio.to_thread(write)
-
-    async def _acquire(self):
-        if self.directory is None:
-            return
-        if fcntl is None:
-            raise SessionError("File-backed LocalSession currently requires POSIX flock")
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        guard = self.directory / "writer.lock"
-        file = os.fdopen(os.open(guard, os.O_CREAT | os.O_RDWR, 0o600), "rb+")
-        try:
-            fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._reload(repair=True)
-        except BlockingIOError:
-            file.close()
-            raise SessionBusyError("Another process is writing this local session") from None
-        except BaseException:
-            file.close()
-            raise
-        self._writer = file
-
-    async def _release(self):
-        if self._writer:
-            self._writer.close()
-            self._writer = None
+        self._tail_boundary = None
 
     async def _persist(self, seq, record):
         if self.path is None:
@@ -198,6 +166,11 @@ class LocalSession(Session):
         line = encode(envelope) + b"\n"
 
         def write():
+            self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if self._tail_boundary is not None:
+                with self.path.open("r+b") as file:
+                    file.truncate(self._tail_boundary)
+                self._tail_boundary = None
             new_file = not self.path.exists()
             descriptor = os.open(self.path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
             with os.fdopen(descriptor, "ab") as file:

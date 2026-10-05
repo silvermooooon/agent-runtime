@@ -61,6 +61,8 @@ class AgentState:
 
 
 class Agent:
+    """One execution flow per session, confined to its event loop; the host owns scheduling."""
+
     def __init__(
         self,
         *,
@@ -158,7 +160,6 @@ class Agent:
         self.signal = None
         self._idle = asyncio.Event()
         self._idle.set()
-        self._session_revision = self.session.revision
 
     def subscribe(self, listener):
         """Listeners run in registration order and are awaited, including agent_end."""
@@ -182,44 +183,11 @@ class Agent:
         self._follow_up.messages.append(message)
 
     async def enqueue(self, message, *, follow_up=False):
-        """Durably accept queued input; synchronous steer/follow_up remain immediate RAM APIs."""
-        message = user_message(message) if isinstance(message, str) else dict(message)
-        message["queueId"] = uuid4().hex
-        own_writer = not self.state.is_streaming
-        if own_writer:
-            await self.session.acquire()
-        try:
-            if own_writer and self.session.revision != self._session_revision:
-                raise SessionError("Session changed in another writer; reopen Agent before enqueue")
-            await self.session.commit(
-                "input_queued", queue="follow_up" if follow_up else "steering", message=message
-            )
-            queue = self._follow_up if follow_up else self._steering
-            queue.messages.append(message)
-            self._session_revision = self.session.revision
-        finally:
-            if own_writer:
-                await self.session.release()
+        """Queue input in memory. The running loop persists it at its next safe boundary."""
+        (self.follow_up if follow_up else self.steer)(message)
 
     def clear_steering_queue(self):
         self._steering.messages.clear()
-
-    async def clear_queued_inputs(self):
-        """Durably clear both pending queues; synchronous clear methods only change RAM."""
-        own_writer = not self.state.is_streaming
-        if own_writer:
-            await self.session.acquire()
-        try:
-            if own_writer and self.session.revision != self._session_revision:
-                raise SessionError(
-                    "Session changed in another writer; reopen Agent before clearing"
-                )
-            await self.session.commit("queues", steering=[], follow_up=[])
-            self.clear_all_queues()
-            self._session_revision = self.session.revision
-        finally:
-            if own_writer:
-                await self.session.release()
 
     def clear_follow_up_queue(self):
         self._follow_up.messages.clear()
@@ -290,15 +258,8 @@ class Agent:
         no old conversational messages. Generated summaries use the configured recent budget.
         """
         self._check_idle()
-        await self.session.acquire()
-        try:
-            if self.session.revision != self._session_revision:
-                raise SessionError("Session changed; reopen Agent before compacting")
-            if self.session.resumable:
-                raise SessionError("Resume unfinished work before manual compaction")
-        except BaseException:
-            await self.session.release()
-            raise
+        if self.session.resumable:
+            raise SessionError("Resume unfinished work before manual compaction")
         try:
             self.state.is_streaming = True
             self.signal = AbortSignal()
@@ -316,11 +277,8 @@ class Agent:
             self.state.messages = self.session.build_context()
             self.state.is_streaming = False
             self.signal = None
-            try:
-                await self.session.release()
-            finally:
-                self._session_revision = self.session.revision
-                self._idle.set()
+            self.session.live.clear()
+            self._idle.set()
 
     async def _compact_before_request(self, context, model, options, signal):
         await self.session.sync_context(context.messages)
@@ -430,16 +388,10 @@ class Agent:
 
     async def _run(self, prompts, skip_initial_steering=False, resume=False):
         self._check_idle()
-        await self.session.acquire()
         saved = self.session.snapshot
-        if not resume and self.session.revision != self._session_revision:
-            await self.session.release()
-            raise SessionError("Session changed in another writer; reopen Agent before new input")
         if resume and not self.session.resumable:
-            await self.session.release()
             raise SessionError("No unfinished session run to resume")
         if not resume and self.session.resumable:
-            await self.session.release()
             raise SessionError("Session has unfinished work; call resume() or reset_session()")
         if resume:
             missing = [
@@ -448,10 +400,8 @@ class Agent:
                 if getattr(self, name) is None or getattr(self, name) is default_convert_to_llm
             ]
             if missing:
-                await self.session.release()
                 raise SessionError(f"Re-inject required runtime hooks before resuming: {missing}")
             if saved["phase"] == "model" and tool_records(self.state.tools) != saved["tools"]:
-                await self.session.release()
                 raise SessionError("Re-inject the original tools before resuming a model request")
             self.state.messages = saved["messages"]
             original = restore_model(saved["model"])
@@ -460,23 +410,31 @@ class Agent:
                 self.state.model.provider,
                 self.state.model.api,
             ):
-                await self.session.release()
                 raise SessionError("Resume requires the original provider, model and API")
             self.state.model = replace(original, headers=self.state.model.headers)
-            self._steering.messages = saved["steering"]
-            self._follow_up.messages = saved["follow_up"]
+            for name, queue in (("steering", self._steering), ("follow_up", self._follow_up)):
+                persisted = saved[name]
+                ids = {message.get("queueId") for message in persisted}
+                queue.messages = persisted + [
+                    message for message in queue.messages if message.get("queueId") not in ids
+                ]
         self.state.is_streaming = True
         self.state.error_message = None
         self.state.streaming_message = None
         self.signal = AbortSignal()
         self._idle.clear()
 
-        def steering():
+        async def steering():
             nonlocal skip_initial_steering
+            await self._save_queues()
             if skip_initial_steering:
                 skip_initial_steering = False
                 return []
             return self._steering.drain()
+
+        async def follow_up():
+            await self._save_queues()
+            return self._follow_up.drain()
 
         options = {**self.parameters, "reasoning": self.state.thinking_level}
         if self.api_key:
@@ -488,7 +446,7 @@ class Agent:
             transform_context=self.transform_context,
             get_api_key=self.get_api_key,
             get_steering_messages=steering,
-            get_follow_up_messages=self._follow_up.drain,
+            get_follow_up_messages=follow_up,
             before_tool_call=self.before_tool_call,
             after_tool_call=self.after_tool_call,
             finish_turn=self.finish_turn,
@@ -506,16 +464,19 @@ class Agent:
         context = AgentContext(list(self.state.messages), list(self.state.tools))
         try:
             if resume:
-                return await run_agent_loop_resume(
+                result = await run_agent_loop_resume(
                     context, config, self._process, self.signal, self.stream_function
                 )
-            if prompts is None:
-                return await run_agent_loop_continue(
+            elif prompts is None:
+                result = await run_agent_loop_continue(
                     context, config, self._process, self.signal, self.stream_function
                 )
-            return await run_agent_loop(
-                prompts, context, config, self._process, self.signal, self.stream_function
-            )
+            else:
+                result = await run_agent_loop(
+                    prompts, context, config, self._process, self.signal, self.stream_function
+                )
+            await self._save_queues()
+            return result
         except asyncio.CancelledError:
             self.signal.abort()
             if not self.session._failed and self.session.resumable:
@@ -574,25 +535,27 @@ class Agent:
             self.state.streaming_message = None
             self.state.pending_tool_calls.clear()
             self.signal = None
-            try:
-                await self.session.release()
-            finally:
-                self._session_revision = self.session.revision
-                self._idle.set()
+            self.session.live.clear()
+            self._idle.set()
+
+    async def _save_queues(self):
+        await self.session.sync_queues(self._steering.messages, self._follow_up.messages)
 
     async def reset_session(self):
         """Explicitly abandon pending work and append a reset; old audit records remain."""
         self._check_idle()
-        await self.session.acquire()
+        self.state.is_streaming = True
+        self._idle.clear()
         try:
-            baseline = current_system_message(self.session.snapshot["messages"])
+            baseline = current_system_message(self.session.build_context())
             messages = [baseline] if baseline else []
             await self.session.commit("history_reset", messages=messages)
-            self.reset()
             self.state.messages = messages
-            self._session_revision = self.session.revision
+            self.state.error_message = None
+            self.clear_all_queues()
         finally:
-            await self.session.release()
+            self.state.is_streaming = False
+            self._idle.set()
 
     async def _process(self, event):
         self.session.observe(event)

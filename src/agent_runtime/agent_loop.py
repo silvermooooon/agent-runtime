@@ -394,33 +394,27 @@ async def _prepare_tool(context, assistant, call, config, signal):
         return None, None, _error_result(str(error))
 
 
-async def _execute_prepared(context, assistant, call, tool, args, config, signal, on_update):
+async def _invoke_tool(call, tool, args, signal, on_update):
     accepting = True
-    updates = []
 
     def update(result):
-        if not accepting:
-            return
-        result = result.to_dict() if isinstance(result, AgentToolResult) else result
-        updates.append(asyncio.create_task(maybe_await(on_update(result))))
+        if accepting:
+            result = result.to_dict() if isinstance(result, AgentToolResult) else result
+            on_update(deepcopy(result))
 
-    result = config.session.returned_result(call["id"]) if config.session else None
     try:
-        if result is None:
-            try:
-                signal.throw_if_aborted()
-                result = await maybe_await(tool.execute(call["id"], args, signal, update))
-                result = result.to_dict() if isinstance(result, AgentToolResult) else dict(result)
-            except SessionError:
-                raise
-            except Exception as error:
-                result = _error_result(str(error))
-            if config.session:
-                await config.session.tool_returned(call, result)
+        signal.throw_if_aborted()
+        result = await maybe_await(tool.execute(call["id"], args, signal, update))
+        return result.to_dict() if isinstance(result, AgentToolResult) else dict(result)
+    except SessionError:
+        raise
+    except Exception as error:
+        return _error_result(str(error))
     finally:
         accepting = False
-        if updates:
-            await asyncio.gather(*updates)
+
+
+async def _finish_tool(context, assistant, call, args, result, config, signal):
     try:
         after = await _hook(
             config.after_tool_call,
@@ -471,16 +465,19 @@ async def run_tool_call(
     resolution = AgentContext(context.messages, list(tools))
     tool, args, result = await _prepare_tool(resolution, assistant_message, call, config, signal)
     if result is None:
-        result = await _execute_prepared(
+        outcomes = await _run_tools(
+            [(call, tool, args)],
             context,
             assistant_message,
-            call,
-            tool,
-            args,
             config,
             signal,
-            on_update or (lambda _: None),
+            lambda event: (
+                (on_update or (lambda _: None))(event["partialResult"])
+                if event["type"] == "tool_execution_update"
+                else None
+            ),
         )
+        result = outcomes[call["id"]]
     return {"toolCall": call, "result": result, "isError": result.get("isError", False)}
 
 
@@ -507,29 +504,6 @@ async def _execute_tools(context, assistant, calls, config, signal, emit):
             )
         )
         return call, result
-
-    async def execute(call, tool, args):
-        if config.session and config.session.returned_result(call["id"]) is None:
-            await config.session.tool_started(call, args)
-        result = await _execute_prepared(
-            context,
-            assistant,
-            call,
-            tool,
-            args,
-            config,
-            signal,
-            lambda partial: emit(
-                {
-                    "type": "tool_execution_update",
-                    "toolCallId": call["id"],
-                    "toolName": call["name"],
-                    "args": call["arguments"],
-                    "partialResult": partial,
-                }
-            ),
-        )
-        return await end(call, result)
 
     def result_message(outcome):
         return (
@@ -564,7 +538,10 @@ async def _execute_tools(context, assistant, calls, config, signal, emit):
         if result is not None:
             outcome = await end(call, result)
         elif sequential:
-            outcome = await execute(call, tool, args)
+            completed = await _run_tools(
+                [(call, tool, args)], context, assistant, config, signal, emit
+            )
+            outcome = (call, completed[call["id"]])
         else:
             # Do not execute until ALL calls have passed sequential preflight, as in pi.
             outcome = None
@@ -578,20 +555,93 @@ async def _execute_tools(context, assistant, calls, config, signal, emit):
         if signal.aborted:
             break
     if not sequential and not truncated:
-
-        async def resolve(entry):
-            call, tool, args, outcome = entry
-            return outcome if outcome is not None else await execute(call, tool, args)
-
-        # TaskGroup cancels sibling executions if an event sink fails.
-        async with asyncio.TaskGroup() as group:
-            running = [group.create_task(resolve(entry)) for entry in tasks]
-        outcomes = [task.result() for task in running]
+        completed = await _run_tools(
+            [(call, tool, args) for call, tool, args, outcome in tasks if outcome is None],
+            context,
+            assistant,
+            config,
+            signal,
+            emit,
+        )
+        outcomes = [outcome or (call, completed[call["id"]]) for call, _, _, outcome in tasks]
         for outcome in outcomes:
             msg = result_message(outcome)
             await _emit_message(msg, emit)
             messages.append(msg)
     return messages, bool(outcomes) and all(r.get("terminate") is True for _, r in outcomes)
+
+
+async def _run_tools(entries, context, assistant, config, signal, emit):
+    """Tool tasks only return data. This caller alone checkpoints and publishes events."""
+    events = asyncio.Queue()
+    outcomes, update_errors = {}, {}
+    session = config.session
+
+    async def invoke(call, tool, args):
+        result = await _invoke_tool(
+            call,
+            tool,
+            args,
+            signal,
+            lambda partial: events.put_nowait(("update", call, args, partial)),
+        )
+        events.put_nowait(("result", call, args, result))
+
+    try:
+        async with asyncio.TaskGroup() as group:
+            for call, tool, args in entries:
+                result = session.returned_result(call["id"]) if session else None
+                if result is not None:
+                    events.put_nowait(("result", call, args, result))
+                else:
+                    if session:
+                        await session.tool_started(call, args)
+                    group.create_task(invoke(call, tool, args))
+            while len(outcomes) < len(entries):
+                kind, call, args, result = await events.get()
+                call_id = call["id"]
+                if kind == "update":
+                    if call_id not in update_errors:
+                        try:
+                            await maybe_await(
+                                emit(
+                                    {
+                                        "type": "tool_execution_update",
+                                        "toolCallId": call_id,
+                                        "toolName": call["name"],
+                                        "args": args,
+                                        "partialResult": result,
+                                    }
+                                )
+                            )
+                        except Exception as error:
+                            # Keep the raw outcome recoverable if display delivery fails.
+                            update_errors[call_id] = error
+                    continue
+                if session and session.returned_result(call_id) is None:
+                    await session.tool_returned(call, result)
+                if call_id in update_errors:
+                    raise update_errors[call_id]
+                result = await _finish_tool(context, assistant, call, args, result, config, signal)
+                if session:
+                    await session.tool_finished(call, result)
+                await maybe_await(
+                    emit(
+                        {
+                            "type": "tool_execution_end",
+                            "toolCallId": call_id,
+                            "toolName": call["name"],
+                            "result": result,
+                            "isError": result.get("isError", False),
+                        }
+                    )
+                )
+                outcomes[call_id] = result
+    except BaseExceptionGroup as error:
+        if len(error.exceptions) == 1:
+            raise error.exceptions[0] from None
+        raise
+    return outcomes
 
 
 def _tool_message(call, result):

@@ -111,45 +111,55 @@ class Models:
     def get_providers(self):
         return sorted(set(self._providers) | {m.provider for m in self._models.values()})
 
-    def stream_simple(self, model: Model, context, options=None):
+    async def stream_simple(self, model: Model, context, options=None):
         options = {**self.config.parameters, "timeout": self.config.timeout, **(options or {})}
         if model.api in self._streams:
-            return self._streams[model.api](model, context, options)
+            return await maybe_await(self._streams[model.api](model, context, options))
         stream = AssistantMessageEventStream()
         named_stream = ToolNameStream(stream, context)
         output = assistant_message(model)
         signal = options.get("signal") or AbortSignal()
 
+        # Preparation is awaited by the loop before starting the HTTP producer.
+        # Its checkpoint is committed by the same coroutine as every other transition.
+        try:
+            signal.throw_if_aborted()
+            if model.api not in PARSERS:
+                raise ValueError(f"No provider adapter for API: {model.api}")
+            provider = self._providers.get(model.provider)
+            restored = options.get("_resume_parameters")
+            if restored:
+                report = ParameterReport(
+                    parameters=deepcopy(restored["parameters"]),
+                    dropped=deepcopy(restored["dropped"]),
+                    adjusted=deepcopy(restored["adjusted"]),
+                )
+                options["timeout"] = restored["timeout"]
+            else:
+                report = normalize_parameters(
+                    model,
+                    options,
+                    provider_policy=provider.parameter_policy if provider else None,
+                    context=context,
+                )
+        except Exception as error:
+            output["stopReason"] = "aborted" if signal.aborted else "error"
+            output["errorMessage"] = str(error) or "Operation aborted"
+            named_stream.push({"type": "error", "reason": output["stopReason"], "error": output})
+            return stream
+        session = options.get("_session")
+        if session and not restored:
+            await session.commit(
+                "provider_parameters",
+                parameters=report.parameters,
+                dropped=report.dropped,
+                adjusted=report.adjusted,
+                timeout=options.get("timeout", 120),
+            )
+
         async def produce():
             async def request():
                 signal.throw_if_aborted()
-                if model.api not in PARSERS:
-                    raise ValueError(f"No provider adapter for API: {model.api}")
-                provider = self._providers.get(model.provider)
-                restored = options.get("_resume_parameters")
-                if restored:
-                    report = ParameterReport(
-                        parameters=deepcopy(restored["parameters"]),
-                        dropped=deepcopy(restored["dropped"]),
-                        adjusted=deepcopy(restored["adjusted"]),
-                    )
-                    options["timeout"] = restored["timeout"]
-                else:
-                    report = normalize_parameters(
-                        model,
-                        options,
-                        provider_policy=provider.parameter_policy if provider else None,
-                        context=context,
-                    )
-                session = options.get("_session")
-                if session and not restored:
-                    await session.commit(
-                        "provider_parameters",
-                        parameters=report.parameters,
-                        dropped=report.dropped,
-                        adjusted=report.adjusted,
-                        timeout=options.get("timeout", 120),
-                    )
                 if options.get("on_parameters"):
                     await maybe_await(options["on_parameters"](deepcopy(report), model))
                 payload = build_payload(model, context, report.parameters)

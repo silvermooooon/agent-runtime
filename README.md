@@ -245,6 +245,10 @@ uv run python examples/session_projection.py
 
 ## 外层集成边界
 
+同一 Session 同时只由一个 Agent 执行，实例限于同一事件循环使用；平台负责执行者调度、接管和失效控制。主执行协程统一修改状态并提交 Session，工具任务只交回进度和结果。切换 Worker 时重新打开 Session。
+
+`steer()`、`follow_up()` 和 `await enqueue()` 只进入内存队列，主流程在安全边界保存；入队返回不是持久化确认。需要可靠接收时由平台先保存输入。直接使用模型层时，先 `stream = await models.stream_simple(model, context, options)`，再消费事件。
+
 `subscribe` 回调按注册顺序等待，`agent_end` 的回调也完成后才进入 idle。
 Session 保存和恢复由 Runtime 直接调用，不依赖事件订阅。`message_update` 可用于向独立 UI 缓冲区投递增量，完整事件可用于额外审计。UI 投递失败应由调用方隔离处理；Session 保存失败会抛出 `SessionError` 并停止推进。
 

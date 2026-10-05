@@ -15,11 +15,7 @@ from .projection import append_messages, apply_compaction, replace_messages
 
 
 class SessionError(RuntimeError):
-    """Persistence, format, ownership or recovery contract failure; never a tool result."""
-
-
-class SessionBusyError(SessionError):
-    pass
+    """Persistence, format or recovery contract failure; never a tool result."""
 
 
 class ToolRecoveryRequired(SessionError):
@@ -267,7 +263,7 @@ def reduce_record(state, record):
 
 
 class Session(ABC):
-    """Shared execution semantics. Subclasses implement ordered storage and writer ownership."""
+    """Ordered session transitions. The caller supplies a single execution coroutine."""
 
     durable = False
 
@@ -275,9 +271,7 @@ class Session(ABC):
         self.session_id = uuid4().hex if session_id is None else session_id
         self._state = empty_state()
         self._seq = 0
-        self._busy = False
         self._failed = False
-        self._commit_lock = asyncio.Lock()
         self.live = {}  # Bounded latest-value snapshots, never a token event queue.
 
     @property
@@ -333,7 +327,6 @@ class Session(ABC):
             }
         )
         state = replay_records(records)
-        await target.acquire()
         try:
             if target.revision:
                 raise SessionError("Fork target must be empty")
@@ -353,95 +346,63 @@ class Session(ABC):
                 raise
             target._failed = True
             raise SessionError(f"Fork journal publication failed: {error}") from error
-        finally:
-            await target.release()
         return target
 
-    async def acquire(self):
-        if self._busy:
-            raise SessionBusyError("Session already has an active writer")
-        self._busy = True
+    async def commit(self, kind, **data):
+        if self._failed:
+            raise SessionError("Session persistence failed; reopen the session before continuing")
         try:
-            await self._acquire()
-            self._failed = False
-        except BaseException:
-            self._busy = False
-            raise
-
-    async def release(self):
-        # Wait for already queued commits before releasing writer ownership. Repeated
-        # cancellation must not abandon a release that is waiting for a durable write.
-        async def finish():
-            async with self._commit_lock:
-                try:
-                    await self._release()
-                finally:
-                    self._busy = False
-                    self.live.clear()
-
-        task = asyncio.create_task(finish())
+            record = json.loads(
+                json.dumps(
+                    {
+                        "id": uuid4().hex,
+                        "type": kind,
+                        "seq": self._seq,
+                        "data": data,
+                        "time": timestamp(),
+                        "run_id": data.get("run_id", self._state["run_id"]),
+                    },
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            )
+            # Reducers replace nested values, and only mutate top-level containers.
+            # Copy those containers without copying the full message/result history.
+            candidate = {
+                key: value.copy() if isinstance(value, (list, dict)) else value
+                for key, value in self._state.items()
+            }
+            reduce_record(candidate, record)
+        except (TypeError, ValueError, KeyError) as error:
+            raise SessionError(f"Invalid session record {kind}: {error}") from error
+        task = asyncio.create_task(self._persist(self._seq, record))
         cancelled = False
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                cancelled = True
-        task.result()
+        try:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    # Settle the write before publishing state or propagating cancellation.
+                    cancelled = True
+            task.result()
+        except Exception as error:
+            self._failed = True
+            raise SessionError(f"Session persistence failed: {error}") from error
+        self._state, self._seq = candidate, self._seq + 1
         if cancelled:
             raise asyncio.CancelledError
-
-    async def commit(self, kind, **data):
-        async with self._commit_lock:
-            if not self._busy or self._failed:
-                raise SessionError("Session needs an active, healthy writer")
-            try:
-                record = json.loads(
-                    json.dumps(
-                        {
-                            "id": uuid4().hex,
-                            "type": kind,
-                            "seq": self._seq,
-                            "data": data,
-                            "time": timestamp(),
-                            "run_id": data.get("run_id", self._state["run_id"]),
-                        },
-                        ensure_ascii=False,
-                        allow_nan=False,
-                    )
-                )
-                # Reducers replace nested values, and only mutate top-level containers.
-                # Copy those containers without copying the full message/result history.
-                candidate = {
-                    key: value.copy() if isinstance(value, (list, dict)) else value
-                    for key, value in self._state.items()
-                }
-                reduce_record(candidate, record)
-            except (TypeError, ValueError, KeyError) as error:
-                raise SessionError(f"Invalid session record {kind}: {error}") from error
-            task = asyncio.create_task(self._persist(self._seq, record))
-            cancelled = False
-            try:
-                while not task.done():
-                    try:
-                        await asyncio.shield(task)
-                    except asyncio.CancelledError:
-                        # Repeated cancellation must not release an in-flight file writer.
-                        cancelled = True
-                task.result()
-            except Exception as error:
-                self._failed = True
-                raise SessionError(f"Session persistence failed: {error}") from error
-            self._state, self._seq = candidate, self._seq + 1
-            if cancelled:
-                raise asyncio.CancelledError
-            return deepcopy(record)
+        return deepcopy(record)
 
     async def sync_context(self, messages):
         if messages != self._state["messages"]:
             await self.commit("context_replaced", messages=messages)
 
+    async def sync_queues(self, steering, follow_up):
+        if steering != self._state["steering"] or follow_up != self._state["follow_up"]:
+            await self.commit("queues", steering=steering, follow_up=follow_up)
+
     async def compact(self, summary, first_kept_message_id, *, tokens_before=0, details=None):
-        """Append a compaction under the active writer; old records remain untouched."""
+        """Append a compaction; old records remain untouched."""
         return await self.commit(
             "compaction",
             summary=summary,
@@ -566,23 +527,17 @@ class Session(ABC):
         await self._resolve(call_id)
 
     async def _resolve(self, call_id, result=None):
-        await self.acquire()
-        try:
-            if (
-                call_id not in self._state["started"]
-                or call_id in self._state["results"]
-                or call_id in self._state["returned"]
-            ):
-                raise SessionError("Call is not an unresolved started tool")
-            if result is None:
-                await self.commit("tool_retry_authorized", call_id=call_id)
-            else:
-                result = result.to_dict() if isinstance(result, AgentToolResult) else result
-                await self.commit(
-                    "tool_completed", call_id=call_id, result=result, time=timestamp()
-                )
-        finally:
-            await self.release()
+        if (
+            call_id not in self._state["started"]
+            or call_id in self._state["results"]
+            or call_id in self._state["returned"]
+        ):
+            raise SessionError("Call is not an unresolved started tool")
+        if result is None:
+            await self.commit("tool_retry_authorized", call_id=call_id)
+        else:
+            result = result.to_dict() if isinstance(result, AgentToolResult) else result
+            await self.commit("tool_completed", call_id=call_id, result=result, time=timestamp())
 
     def observe(self, event):
         kind = event["type"]
@@ -607,12 +562,6 @@ class Session(ABC):
 
     async def _import_records(self, records):
         raise NotImplementedError("This backend does not implement atomic journal import")
-
-    @abstractmethod
-    async def _acquire(self): ...
-
-    @abstractmethod
-    async def _release(self): ...
 
 
 def replay_records(records):

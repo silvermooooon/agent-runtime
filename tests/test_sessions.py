@@ -12,7 +12,6 @@ from agent_runtime import (
     Agent,
     AgentToolResult,
     LocalSession,
-    SessionBusyError,
     SessionError,
     ToolRecoveryRequired,
 )
@@ -267,7 +266,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                 await second.resume()
                 self.assertEqual([m["role"] for m in second.state.messages], ["user", "assistant"])
 
-    async def test_torn_tail_is_ignored_then_repaired_under_writer_ownership(self):
+    async def test_torn_tail_is_ignored_then_repaired_on_next_append(self):
         first = Agent(session=self.session(), model=MODEL, stream_fn=FakeProvider(answer()))
         await first.prompt("one")
         prefix = first.session.path.read_bytes()
@@ -290,17 +289,6 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         first.session.path.write_bytes(b"".join(lines))
         with self.assertRaises(SessionError):
             self.session()
-
-    async def test_writer_guard_prevents_two_local_writers(self):
-        first, second = self.session(), self.session()
-        await first.acquire()
-        try:
-            with self.assertRaises(SessionBusyError):
-                await second.acquire()
-        finally:
-            await first.release()
-        await second.acquire()
-        await second.release()
 
     async def test_storage_failure_stops_before_tool_and_does_not_fake_a_result(self):
         class FailingSession(LocalSession):
@@ -371,12 +359,15 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         texts = [m["content"][0]["text"] for m in second.state.messages if m["role"] == "user"]
         self.assertEqual(texts.count("queued"), 1)
 
-    async def test_durable_enqueue_survives_before_start(self):
+    async def test_enqueue_is_in_memory_until_execution_boundary(self):
         first = Agent(session=self.session(), model=MODEL, stream_fn=FakeProvider(answer()))
         await first.enqueue("queued")
-        second = self.reopen(model=MODEL, stream_fn=FakeProvider(answer()))
-        await second.prompt("start")
-        texts = [m["content"][0]["text"] for m in second.state.messages if m["role"] == "user"]
+        self.assertFalse(first.session.read_records())
+        self.assertFalse(self.session().snapshot["steering"])
+        await first.prompt("start")
+        texts = [
+            m["content"][0]["text"] for m in self.session().build_context() if m["role"] == "user"
+        ]
         self.assertEqual(texts, ["start", "queued"])
 
     async def test_reset_abandons_pending_work_without_erasing_audit(self):
@@ -457,15 +448,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(SessionError, "required runtime hooks"):
             await second.resume()
 
-    async def test_stale_agent_cannot_overwrite_newer_history(self):
-        first = Agent(session=self.session(), model=MODEL, stream_fn=FakeProvider(answer()))
-        stale = Agent(session=self.session(), model=MODEL, stream_fn=FakeProvider(answer()))
-        await first.prompt("first")
-        with self.assertRaisesRegex(SessionError, "another writer"):
-            await stale.prompt("second")
-        self.assertEqual(self.session().snapshot["messages"][0]["content"][0]["text"], "first")
-
-    async def test_repeated_cancel_waits_for_commit_before_releasing_writer(self):
+    async def test_repeated_cancel_waits_for_commit_before_returning(self):
         entered, finish = asyncio.Event(), asyncio.Event()
 
         class SlowSession(LocalSession):
@@ -482,16 +465,14 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         task.cancel()
         await asyncio.sleep(0)
         task.cancel()
-        with self.assertRaises(SessionBusyError):
-            await self.session().acquire()
+        self.assertFalse(task.done())
+        self.assertTrue(agent.state.is_streaming)
         finish.set()
         with self.assertRaises(asyncio.CancelledError):
             await task
         restored = self.session()
         self.assertTrue(restored.resumable)
         self.assertEqual(restored.snapshot["messages"][0]["content"][0]["text"], "go")
-        await restored.acquire()
-        await restored.release()
 
     async def test_abort_before_tool_preserves_unexecuted_plan(self):
         first = Agent(
@@ -537,7 +518,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         await second.resume()
         self.assertEqual(keys[0], keys[1])
 
-    async def test_actual_process_exit_keeps_journal_and_releases_writer(self):
+    async def test_actual_process_exit_keeps_journal_for_new_worker(self):
         import sys
 
         from agent_runtime import AgentTool
@@ -655,10 +636,10 @@ asyncio.run(Agent(session=LocalSession("test", sys.argv[1]), model=model,
         texts = [m["content"][0]["text"] for m in second.state.messages if m["role"] == "user"]
         self.assertEqual(texts, ["first", "queued"])
 
-    async def test_durable_clear_and_transformed_system_queue_consumption(self):
+    async def test_clear_and_transformed_system_queue_consumption(self):
         first = Agent(session=self.session(), model=MODEL, stream_fn=FakeProvider(answer()))
         await first.enqueue("remove me")
-        await first.clear_queued_inputs()
+        first.clear_all_queues()
         await first.enqueue(
             {
                 "role": "system",

@@ -221,7 +221,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             )
         ) as client:
             models = Models(api_keys={"openai": "test-only"}, client=client)
-            stream = models.stream_simple(
+            stream = await models.stream_simple(
                 models.get_model("openai", "test-reasoner"), AgentContext()
             )
             result = await asyncio.wait_for(stream.result(), 1)

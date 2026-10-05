@@ -24,15 +24,14 @@ await agent.prompt("处理这个任务")
 ## 保存内容
 
 内存中的 `session.live` 只保留最新的模型输出和各个运行中工具的进度，不累积 token 事件列表。
-运行结束或释放写入权时清空。历史投影也缓存在内存中供 Runtime 使用，其持久依据是文件记录。
+运行结束时清空。历史投影也缓存在内存中供 Runtime 使用，其持久依据是文件记录。
 
 每个文件 Session 对应：
 
 ```text
 sessions/
 └── conversation-123/
-    ├── events.jsonl
-    └── writer.lock
+    └── events.jsonl
 ```
 
 `events.jsonl` 为追加写入的结构化记录。每条有格式版本、session 身份、连续序号和 SHA-256 校验；
@@ -42,7 +41,7 @@ sessions/
 | 记录 | 内容与作用 |
 | --- | --- |
 | run_started | 本轮输入、模型元数据、参数、工具定义和版本、调度方式、所需钩子名称 |
-| messages_added / input_queued / queues | 注入上下文、已接受的排队输入以及消费进度 |
+| messages_added / queues | 注入上下文、安全边界处的排队输入及消费进度 |
 | model_request | 当前模型配置；上下文或转换后的输入发生变化时记录相应内容 |
 | provider_parameters | SDK 内置 HTTP adapter 最终过滤／重写后的参数及处理报告 |
 | model_completed | 完整结构化模型消息，保留必要的 Responses 原始 output／reasoning 数据 |
@@ -72,11 +71,11 @@ Runtime 在关键位置直接等待 Session 的保存方法，不通过 `subscri
 
 - 模型完整响应可靠保存后，才开始工具处理。
 - 工具执行意图可靠保存后，才调用执行器。
-- 原始工具结果在等待进度回调或运行 after_tool_call 之前保存。
+- 主流程逐个接收工具结果，先保存原始结果，再运行 after_tool_call；不等待整批工具结束。
 - 最终工具结果可靠保存后，才发出完成事件并供后续模型使用。
 - 文件写入失败会抛出 `SessionError`，停止推进，不转换成可忽略的工具错误。
-- 取消发生在文件提交过程中时，等待该次提交结算后再释放写入权。
-- 释放写入权与提交共用现有的进程内提交锁；已经排队的提交先结算，随后到达的提交重新检查写入权。重复取消也会等待释放完成。
+- 取消发生在文件提交过程中时，等待该次提交结算、更新投影后再传播取消，避免后台文件写入尚未结束就报告运行结束。
+- 持久化失败后重新打开 Session；当前实例不继续提交。
 
 外部事件订阅仍用于 SSE、UI 或额外审计。订阅异常可能停止执行，但不能替代 Session 恢复协议。
 外部已经保存的业务动作不会因为后续回调失败而被撤销。
@@ -113,7 +112,7 @@ else:
 尚无存储日志的物理压缩、历史分页索引或定期快照加速。
 业务查询可使用 `session.snapshot`、`session.revision` 和 `session.read_records(after_seq=...)`。
 `read_records(after_seq=...)` 每次主动读取文件；向前轮询时只校验、解析尚未读取的尾部，使用一个内存游标，不创建额外索引文件。约定已提交前缀只追加、不原地修改；文件替换、缩短或同长度修改会触发重新校验，完整历史查询始终重新校验。
-`snapshot`、`revision` 和上下文投影不随其他进程的写入自动更新；需要新的投影时重新打开 LocalSession。打开和取得写入权仍会完整重放日志，没有消除超长会话的首次加载成本。
+`snapshot`、`revision` 和上下文投影不随其他进程的写入自动更新；需要新的投影时重新打开 LocalSession。打开时仍会完整重放日志，没有消除超长会话的首次加载成本。
 
 提交时只复制状态的顶层容器，避免每条事件递归复制全部历史。内部 reducer 必须替换嵌套值，不能原地修改旧消息／工具结果；对外返回的快照与上下文仍是独立副本。
 
@@ -143,33 +142,39 @@ await agent.resume()
 审批前或后处理钩子若在自己的完成记录写入前中断，可能重新运行，应避免不可重复的外部副作用。
 当前 before_tool_call 仍是等待式钩子，尚无独立的持久化审批单／pending 决策协议。
 
+## 执行约定
+
+一个 Session 同时只交给一个 Agent 执行，Agent 与 Session 实例限于同一事件循环使用。平台负责调度、Worker 接管，以及阻止失效 Worker 的外部写入。切换执行者时重新打开 Session，不复用旧执行者的内存投影。SSE 重连只恢复展示，不启动新的执行者。
+
+主执行协程顺序调用 `Session.commit()`；Session 子类只需实现 `_persist(seq, record)`、`read_records(after_seq)`，支持分叉时实现 `_import_records(records)`。
+
+- 工具任务只执行工具并交回进度和结果。主流程保存调用意图、原始结果、后处理结果，并更新 Agent / Session 的状态。
+- 工具可以并行执行；结果按完成顺序逐个提交，交给模型的 toolResult 消息仍按原工具计划排序。
+- 内置 `Models.stream_simple()` 是异步准备入口，先由调用协程保存有效请求参数，再启动 HTTP 流；直接使用时写 `stream = await models.stream_simple(model, context, options)`。
+- 工具实现、事件订阅和后台 provider 任务不直接提交 Session。扩展 provider 的参数准备必须在返回事件流之前被主流程等待。
+- 直接调用 Session 的压缩、分叉、结果核实等修改接口时，调用方应保证 Agent 已停止；查询记录不启动运行。修改上下文后重新创建 Agent，或直接使用会同步内存状态的 `Agent.compact()`；结果核实后使用 `Agent.resume()` 读取恢复状态。
+
 ## 停止、排队输入和重置
 
 - `agent.abort()`：协作停止模型和工具；已保存的未完成工作保留，可显式 resume。
 - Python Task 取消：向上继续传播，已提交记录保留；瞬时 UI 状态清空。
-- `await agent.enqueue(text, follow_up=False)`：可靠接受排队输入；返回后可在进程重启时恢复。
-- 原有同步 `steer()` / `follow_up()`：立即更新内存队列，在启动下一次运行时保存现有队列；
-  已进入执行的消息也会保存。需要独立的可靠接收确认时使用 enqueue，不依赖同步方法。
-- `await agent.reset_session()`：明确放弃未完成工作，记录 reset，不删除之前的审计日志。
-- `await agent.clear_queued_inputs()`：可靠清空已接受的排队输入。同步 clear 方法只改变内存；已提交输入需要这个异步入口清除。
+- `steer()`、`follow_up()`、`await agent.enqueue(text, follow_up=False)`：仅将消息放入内存队列，不在请求处理协程中写入 Session。
+- 主流程在运行开始、检查新输入的安全边界及正常结束前保存队列；工具批次结束后再注入 steering，follow-up 在没有工具和 steering 时处理。
+- 入队返回不表示已经持久化。平台若要求接收请求返回时输入就可恢复，应先保存输入，再投递给 Agent。强制退出会丢失尚未到达保存边界的内存输入。
+- `clear_steering_queue()`、`clear_follow_up_queue()`、`clear_all_queues()`：修改内存队列，由主流程在下一保存边界记录。
+- `await agent.reset_session()`：空闲时明确放弃未完成工作，记录 reset，不删除之前的审计日志。
 - 同步 `reset()` 不允许绕过尚未完成的持久运行。
 
-## 本地文件的写入保护和异常尾部
+## 本地日志恢复
 
-每个 session 使用单独的、非阻塞的 POSIX `flock` 写入保护，持有到本次 Agent 运行结束。
-第二个写入者直接收到 `SessionBusyError`；进程退出时系统自动释放，不留下需要清理的租约。
-陈旧 Agent 实例不能覆盖其他写入者新提交的历史，需重新打开。
+打开时读取完整有效记录前缀，只忽略没有换行的最后一个未完整片段；下一次追加前截断该片段。纯查询不会修改文件。中间损坏、完整记录校验失败、序号不连续、未知必需事件或不支持的格式均报错，不能静默丢弃。
 
-只有没有换行的最后一个未完整记录片段可以忽略；取得写入权后截断该片段，再继续追加。
-中间损坏、完整记录校验失败、序号不连续、未知必需事件或不支持的格式均报错，不能静默丢弃。
-
-此实现面向 POSIX 本地文件系统；文件必须仍然存在且可访问。它没有跨主机 Redis 租约、抢占或共享文件系统协调能力。
-不能靠容器临时盘保证 Pod 删除后的恢复；部署方应配置保留数据的存储位置。
+文件持久化及目录同步按 POSIX 本地文件系统验证。部署方应配置保留数据的存储位置，并保证恢复时仍可访问日志；容器临时盘不能保证 Pod 删除后的恢复。
 
 ## 验证与参考
 
 测试覆盖独立进程 os._exit、模型和工具边界中断、原始结果后处理失败、未知副作用、显式重试、
-停止与反复取消、磁盘错误、双写入者、截断尾部、损坏日志、凭据排除、队列恢复和参数重放。
+停止与反复取消、磁盘错误、主流程统一提交、完成结果即时保存、截断尾部、损坏日志、凭据排除、队列边界保存和参数重放。
 
 事件事实来源与独立持久化边界参考 DeepSeek Harness 的
 [Session](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/session.md) 和

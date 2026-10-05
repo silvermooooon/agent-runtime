@@ -56,7 +56,7 @@
 
 - 方法和配置字段使用 snake_case；消息／事件字典保留 pi 的 camelCase。
 - 用 asyncio、httpx 和 jsonschema 替换 TS 的 Promise、厂商 SDK 和 TypeBox。
-- Python TaskGroup 在事件 sink 失败时取消并行兄弟任务；避免异常后遗留后台执行。工具外部副作用仍不因此撤销。
+- 工具任务仅交回进度和原始结果，主流程统一保存并发布事件、串行执行后处理。失败或取消时等待任务结束；已发生的外部副作用仍不因此撤销。
 - 增加 provider/model 参数策略、过滤报告、环境配置与默认 Responses 入口。
 - 增加基于 Session 继承接口的本地事件记录、直接保存边界和 resume 入口；内存瞬时态合并在 LocalSession 中。该恢复协议为 Python SDK 扩展，见 [Session 设计](sessions.md)。
 - Agent 默认创建 LocalSession。开启文件存储时，持久内容必须能序列化为 JSON；原始工具结果在后处理前保存。
@@ -72,6 +72,12 @@
 - MCP 协议收发复用官方 Python `mcp` 2.3 客户端，使用 `ClientSession.send_request` 避免高层 `call_tool` 隐式发现 schema。默认按次连接，平台提供已选 schema 和身份上下文；未移植 Pi 的发现、schema 缓存、OAuth、codemode、资源读取及截断管理。
 - MCP 的模型内容投影直接翻译上述 `toLlmContent`；完整结果另外保留在现有工具结果的 details 内。业务名称使用约定的 `server.tool`，在默认 AI 协议层转为 `server__tool` 后还原，没有移植 Pi 的 hash 命名和冲突处理。
 - Skill 按本项目需求使用 `load_skill` / `load_skill_reference` 专用工具及可继承的 `SkillStore`，没有移植 Pi 通过通用 read 工具读取 Skill 的方式。本地后端支持目录发现和 YAML 元数据，宿主负责提供候选目录，详见 [Skill 加载](skills.md)。
+
+## 执行与持久化边界
+
+平台保证同一 Session 的执行者唯一性，并负责跨 Worker 的接管和失效控制；实例只在所属事件循环中使用。SDK 主流程顺序修改状态和提交日志。追加消息只进入内存队列，入队成功不承诺落盘；可靠接收由平台先保存输入来实现。
+
+并行工具保留 pi 的执行和消息排序语义，持久化结果由主流程按完成顺序保存，后处理钩子也在主流程运行。内置模型 adapter 的准备入口 `Models.stream_simple()` 需要 await，使请求参数能在启动后台 HTTP 流之前由调用协程保存。Session、恢复点和日志投影是本 SDK 的扩展，具体契约见 [Session](sessions.md)。
 
 ## 初版未移植范围
 
@@ -89,7 +95,7 @@
 
 核心测试场景参考上游 `packages/agent/test/agent.test.ts` 与 `agent-loop.test.ts`，覆盖事件顺序、队列、工具校验、串并行、取消和钩子。
 HTTP 测试使用 httpx MockTransport 注入 Responses、Completions、Anthropic、proxy SSE，验证实际请求体及流解析。参数测试使用合成模型元数据，不绑定特定新模型名称。
-Python 流增加有限队列和异步 `send`，内置 adapter 在协议事件之间等待容量；`result()` 明确采用只保留最终结果的消费方式。Session 释放复用提交锁，尾部查询只维护内存游标；bash 的 `output_dir` 复用现有完整输出文件机制。没有增加持久化队列、外部锁服务或附件管理组件。对应回归测试见 `tests/test_runtime_boundaries.py`。
+Python 流增加有限队列和异步 `send`，内置 adapter 在协议事件之间等待容量；`result()` 明确采用只保留最终结果的消费方式。Session 由主流程顺序提交，尾部查询只维护内存游标；bash 的 `output_dir` 复用现有完整输出文件机制。对应回归测试见 `tests/test_runtime_boundaries.py`。
 
 内置工具测试使用真实临时文件和本地 shell，覆盖分页、图片、批量编辑、并发修改、输出截断、超时、取消、审批及 Session 恢复；模型调度部分使用 FakeProvider。
 
