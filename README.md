@@ -2,6 +2,7 @@
 
 以 [pi Agent](https://github.com/earendil-works/pi) 为主参考的异步 Python SDK。
 当前为初始核心移植，面向 Python 3.11+，不是完整 pi-ai、coding-agent 或 SaaS 平台的替代实现。
+项目默认解释器为 Python 3.13，支持 3.11、3.12、3.13；MCP 依赖限制为 `>=2.2,<2.3`，锁定版本为 2.2.0，不要求安装 Python 3.14 或 MCP 2.3。
 
 ## 安装与运行
 
@@ -12,6 +13,8 @@ uv run python -m unittest discover -s tests -v
 ```
 
 也可以使用 `python -m pip install -e .`。凭据由参数、实例级配置或对应环境变量注入，仓库中不保存真实凭据。
+
+内网已有 Python 3.13 时使用 `uv sync --locked --python 3.13 --no-python-downloads`，避免下载解释器。也可以用内网虚拟环境中的 `python -m pip install -e .`，由内网镜像在声明范围内解析依赖；`uv sync --locked` 则需要镜像提供锁文件中的确切版本。
 
 使用 Responses API：复制 [.env.template](.env.template) 为 `.env`，填写 `OPENAI_API_KEY`，默认模型为 `gpt-6-luna`，按需修改 `OPENAI_BASE_URL`，然后执行：
 

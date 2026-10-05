@@ -2,6 +2,24 @@
 
 `agent_runtime.mcp` 随 SDK 提供，只有显式装配的工具才会交给 Agent。平台负责发现、选择工具及提供 JSON Schema；SDK 负责连接、调用和结果适配。装配时不联网，调用前不运行 `tools/list` 或额外健康检查。
 
+## 依赖与兼容范围
+
+依赖范围为 `mcp>=2.2,<2.3`、`httpx2>=2.5,<3`；锁文件使用 MCP / mcp-types 2.2.0、httpx2 / httpcore2 2.5.0。项目默认 Python 3.13，最低 Python 3.11，因为 Runtime 使用标准库的 `TaskGroup`、`asyncio.timeout` 和异常组。
+
+当前的 `ClientSession.send_request`、Streamable HTTP、stdio、动态请求头和进度通知均使用 MCP 2.2 已有接口，不需要版本判断或额外适配层。[MCP 2.2 官方包元数据](https://pypi.org/project/mcp/2.2.0/) 声明支持 Python 3.10+；SDK 的 Python 3.11 下限来自 Runtime 自身。
+
+降级不包含 [MCP 2.3 的修复和新增选项](https://github.com/modelcontextprotocol/python-sdk/releases/tag/v2.3.0)：例如可配置 SSE 事件大小上限，以及省略旧协议空 `_meta` / `params` 的兼容修复。SDK 未使用这些新增选项；对严格校验旧协议请求形状的内网服务器，仍应进行实际联调。SDK 不覆盖依赖的协议实现来模拟这些修复。
+
+2026-10-05 本地兼容验证：以下环境均使用 MCP / mcp-types 2.2.0、httpx2 / httpcore2 2.5.0。
+
+| Python | 完整测试结果 |
+| --- | --- |
+| 3.11.7 | 201 项通过 |
+| 3.12.10 | 201 项通过 |
+| 3.13.2 | 201 项通过 |
+
+测试包含真实本地 HTTP/stdio MCP 协议交互、逐请求头透传、身份隔离、超时、取消与 Session 恢复。在 Python 3.13.2 下另运行 `examples/mcp_tools.py`，通过 MCP 2.2 的 `MCPServer` 子进程完成 `17 + 25 = 42`。这些验证不需要模型 API Key。CI 覆盖 Python 3.11、3.12、3.13，并固定 httpx2 2.5.0 验证依赖下限。
+
 ## 装配方式
 
 ```python

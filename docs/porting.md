@@ -69,7 +69,7 @@
 - 四个内置工具的默认参数和主要行为参考上述固定版本；工具必须显式装配。图片后端使用 Pillow，diff 使用 difflib，因此编码结果和 diff 分块不保证逐字节等同于上游。
 - 文件修改队列使用事件循环内的 asyncio.Lock，等待正在执行的 I/O 结束后释放；不是数据库锁，也不是跨进程锁。工具恢复沿用 SDK 的 replay 协议。
 - 未移植 coding-agent 的 TUI renderer、提示词元数据注入和模型专用图片配置；常用使用说明放入工具 description，图片限制可通过工厂参数显式配置。本地 bash 的进程组取消测试覆盖 macOS/POSIX；Windows 未验证，Windows 默认后端只终止直接子进程。
-- MCP 协议收发复用官方 Python `mcp` 2.3 客户端，使用 `ClientSession.send_request` 避免高层 `call_tool` 隐式发现 schema。默认按次连接，平台提供已选 schema 和身份上下文；未移植 Pi 的发现、schema 缓存、OAuth、codemode、资源读取及截断管理。
+- MCP 协议收发复用官方 Python `mcp` 2.2 客户端，使用 `ClientSession.send_request` 避免高层 `call_tool` 隐式发现 schema。默认按次连接，平台提供已选 schema 和身份上下文；未移植 Pi 的发现、schema 缓存、OAuth、codemode、资源读取及截断管理。
 - MCP 的模型内容投影直接翻译上述 `toLlmContent`；完整结果另外保留在现有工具结果的 details 内。业务名称使用约定的 `server.tool`，在默认 AI 协议层转为 `server__tool` 后还原，没有移植 Pi 的 hash 命名和冲突处理。
 - Skill 按本项目需求使用 `load_skill` / `load_skill_reference` 专用工具及可继承的 `SkillStore`，没有移植 Pi 通过通用 read 工具读取 Skill 的方式。本地后端支持目录发现和 YAML 元数据，宿主负责提供候选目录，详见 [Skill 加载](skills.md)。
 

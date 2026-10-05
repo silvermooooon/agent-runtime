@@ -11,9 +11,9 @@ requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
     "httpx>=0.28,<0.29",
-    "httpx2>=2.10,<3",
+    "httpx2>=2.5,<3",
     "jsonschema>=4.23,<5",
-    "mcp>=2.3,<2.4",
+    "mcp>=2.2,<2.3",
     "pillow>=11,<13",
     "pyyaml>=6,<7",
 ]
