@@ -269,3 +269,10 @@ Session 保存和恢复由 Runtime 直接调用，不依赖事件订阅。`messa
 
 上游固定提交：`83692682f095528f8b71652ddacff7075e36e893`。
 对应文件、保留语义和未移植范围见 [移植映射](docs/porting.md)。保留上游 MIT 许可与版权声明，见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。
+
+## 后台子 Agent
+
+可选的 `agent_runtime.subagents` 提供独立 Session 的后台子任务及五个普通工具，
+显式装配后使用。主 Agent 可以继续工作，再查询或等待子任务结果。
+使用方式、取消与恢复约定见 [子 Agent 文档](docs/subagents.md)。
+离线示例：`uv run python examples/subagents.py`。

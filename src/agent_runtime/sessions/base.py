@@ -132,7 +132,9 @@ def tool_message(call, result, time):
 
 def reduce_record(state, record):
     kind, data = record["type"], record["data"]
-    if kind == "run_started":
+    if kind == "subagent_created":
+        pass  # Composition metadata; never enters model context.
+    elif kind == "run_started":
         for key, incoming in data.get("queues", {}).items():
             for message in incoming:
                 if message not in state[key]:

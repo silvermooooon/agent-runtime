@@ -102,3 +102,11 @@ Python 流增加有限队列和异步 `send`，内置 adapter 在协议事件之
 MCP 测试使用真实本地 HTTP/stdio 传输，验证不触发发现、逐请求头透传、并发身份隔离、审批、进度、完整结果存储、超时及未知结果恢复。`examples/mcp_tools.py` 使用官方 MCPServer 验证 stdio 互操作，`tests/live_mcp.py` 单独验证真实模型到本地 MCP 的工具循环。
 
 真实 provider 测试与离线测试分开运行，已有官方 Responses API 与 gpt-6-luna 的实测记录，见 [在线测试说明](live-testing.md)。这不表示所有厂商兼容端点都已通过验证。
+
+## 后台子 Agent 组合
+
+`subagents` 参考固定提交中 `examples/extensions/subagent`、
+`src/experimental/durable/subagent.ts` 和 `packages/durable/test/examples/23-subagent-background.ts`。
+独立会话和普通工具适配沿用 PI 思路；本 SDK 使用 asyncio 和现有 Session 日志，
+不移植 CLI 子进程、durable Anchor/Reporter 或任务图。
+创建和初始输入去重通过稳定的父工具操作标识及子日志完成；停止和追加输入不可自动重放。
