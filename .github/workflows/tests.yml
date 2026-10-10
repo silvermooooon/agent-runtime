@@ -8,12 +8,24 @@ jobs:
     strategy:
       matrix:
         python: ["3.11", "3.12", "3.13"]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: runtime-test
+          POSTGRES_DB: runtime_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      AGENT_TEST_DB_URL: postgresql://postgres:runtime-test@localhost:5432/runtime_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install -e . 'httpx2==2.5.0' ruff
+      - run: python -m pip install -e '.[postgres,s3]' 'httpx2==2.5.0' ruff
       - run: ruff check src tests examples
       - run: ruff format --check src tests examples
       - run: python -m unittest discover -s tests -v

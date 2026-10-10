@@ -132,7 +132,7 @@ def tool_message(call, result, time):
 
 def reduce_record(state, record):
     kind, data = record["type"], record["data"]
-    if kind == "subagent_created":
+    if kind in ("subagent_created", "model_call_started", "model_call_finished"):
         pass  # Composition metadata; never enters model context.
     elif kind == "run_started":
         for key, incoming in data.get("queues", {}).items():
@@ -275,6 +275,10 @@ class Session(ABC):
         self._seq = 0
         self._failed = False
         self.live = {}  # Bounded latest-value snapshots, never a token event queue.
+
+    def wrap_stream_fn(self, stream_fn):
+        """Optional storage auditing around physical model calls."""
+        return stream_fn
 
     @property
     def snapshot(self):

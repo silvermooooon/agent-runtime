@@ -390,11 +390,6 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 LocalSession(value, self.directory)
 
-    def test_database_file_is_reserved_without_implementation(self):
-        from agent_runtime.sessions import database
-
-        self.assertFalse(hasattr(database, "DatabaseSession"))
-
     async def test_raw_tool_result_survives_crash_in_after_hook(self):
         executions, decisions = [], []
         fail = True

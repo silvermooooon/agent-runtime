@@ -116,6 +116,7 @@ class Agent:
         self.stream_function = stream_fn or (
             models.stream_simple if models else get_default_stream_fn()
         )
+        self.stream_function = self.session.wrap_stream_fn(self.stream_function)
         transcript = restored["messages"] if restored["model"] else list(messages or [])
         tools = list(tools or [])
         if (system_prompt or tools) and (not transcript or transcript[0]["role"] != "system"):

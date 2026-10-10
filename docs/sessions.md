@@ -2,7 +2,7 @@
 
 本版把内存能力合并进 `LocalSession`，不提供独立的 `MemorySession`。
 `Session` 基类定义状态转换和恢复语义；`LocalSession` 通过继承实现文件读写。
-`src/agent_runtime/sessions/database.py` 仅预留位置，没有 DB 实现、驱动、数据表或可实例化的占位类。
+可选 `DatabaseSession` 提供 PostgreSQL 存储、审查与 S3 归档，见 [数据库组件](database.md)。
 
 ## 创建和使用
 
@@ -180,3 +180,7 @@ await agent.resume()
 [Session](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/session.md) 和
 [Persistence](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/persistence.md) 设计。
 Agent loop 继续以本项目固定的 pi 版本为主参考；LocalSession 是本 SDK 的扩展，不宣称兼容其他项目的日志格式。
+
+## PostgreSQL 后端
+
+可选 DatabaseSession、DDL、审查查询及 S3 冷归档见 [数据库组件](database.md)。

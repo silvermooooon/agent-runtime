@@ -13,7 +13,7 @@ from .compaction import CompactionPlan, CompactionSettings, Compactor
 from .config import ProviderConfig, RuntimeConfig
 from .event_stream import AssistantMessageEventStream, EventStream
 from .proxy import stream_proxy
-from .sessions import LocalSession, Session, SessionError, ToolRecoveryRequired
+from .sessions import DatabaseSession, LocalSession, Session, SessionError, ToolRecoveryRequired
 from .stream_fn import set_default_stream_fn
 from .types import (
     AbortSignal,

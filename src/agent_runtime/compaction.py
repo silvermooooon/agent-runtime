@@ -168,6 +168,7 @@ class Compactor:
             }
             request_options.update(
                 signal=signal,
+                _purpose="compaction",
                 max_tokens=max(
                     1, min(model.max_tokens, int(self.settings.reserve_tokens * fraction))
                 ),

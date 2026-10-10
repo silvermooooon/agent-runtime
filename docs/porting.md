@@ -87,7 +87,7 @@
 - 原生 hosted tools、tool search、grammar/custom tools、语音等所有输出类型。遇到未实现的输出块会报错，不假装执行成功。
 - 完整跨模型历史修复、mid-conversation 原生工具变更协议；本版在请求边界折叠 system/tool 声明。
 - TypeBox 专用 symbol 语义与精确 tokenizer。
-- DB Session、Redis 租约、任务接管、权限后端、MCP 工具发现与 SaaS 服务。
+- Redis 租约、任务接管、权限后端、MCP 工具发现与 SaaS 服务。
 
 这些边界不会隐藏在“与 pi 完全等价”的表述下。扩展其他 provider 时应继续对照固定或明确升级的 pi 版本。
 
@@ -110,3 +110,10 @@ MCP 测试使用真实本地 HTTP/stdio 传输，验证不触发发现、逐请�
 独立会话和普通工具适配沿用 PI 思路；本 SDK 使用 asyncio 和现有 Session 日志，
 不移植 CLI 子进程、durable Anchor/Reporter 或任务图。
 创建和初始输入去重通过稳定的父工具操作标识及子日志完成；停止和追加输入不可自动重放。
+
+## PostgreSQL 与审查扩展
+
+DatabaseSession 与 storage 模块是本 SDK 的可选 SaaS 存储实现，不来自 pi 核心。
+保留单会话单写者约定；事件与审查投影同事务，冷日志存 AWS S3 SSE-KMS。
+DDL 与接口见 [数据库组件](database.md)。物理模型调用审查通过 Session 的 stream 包装入口接入，
+LocalSession 不增加调用审查事件，核心 loop 的执行流程不变。

@@ -175,7 +175,7 @@ AGENT_SKILLS_DIR=examples/skill_catalog uv run python examples/skills.py
 
 `Agent()` 默认使用 `LocalSession`，自动分配 session ID，记录写入 `.agent-runtime/sessions/<id>/events.jsonl`。
 内存能力合并在同一个组件中；需要纯内存运行时使用 `LocalSession(directory=None)`。
-DB Session 仅预留文件，尚无数据库实现。
+可选 PostgreSQL `DatabaseSession` 见 [数据库组件](docs/database.md)。
 
 ```python
 from agent_runtime import Agent, LocalSession
@@ -263,7 +263,7 @@ Session 保存和恢复由 Runtime 直接调用，不依赖事件订阅。`messa
 
 前端断开不应取消后台 `agent.prompt()` 所属任务。用户停止时调用 `agent.abort()`；模型网络请求会被中断，工具通过 signal 协作退出。Python 任务本身被取消时，取消会继续向上传播。
 
-`continue_()` 保留 pi 的限制：用于最后一条是 user/toolResult 的历史，不能直接恢复尚未执行完的 assistant 工具计划。`resume()` 可恢复 LocalSession 保存的工具计划和部分完成批次。工具外部幂等、DB Session、Redis 接管、SSE 服务和多租户调度仍由后续实现或宿主负责。
+`continue_()` 保留 pi 的限制：用于最后一条是 user/toolResult 的历史，不能直接恢复尚未执行完的 assistant 工具计划。`resume()` 可恢复 LocalSession 保存的工具计划和部分完成批次。工具外部幂等、Redis 接管、SSE 服务和多租户调度仍由后续实现或宿主负责。
 
 ## 来源与差异
 
@@ -276,3 +276,11 @@ Session 保存和恢复由 Runtime 直接调用，不依赖事件订阅。`messa
 显式装配后使用。主 Agent 可以继续工作，再查询或等待子任务结果。
 使用方式、取消与恢复约定见 [子 Agent 文档](docs/subagents.md)。
 离线示例：`uv run python examples/subagents.py`。
+
+## PostgreSQL Session、审查与冷归档
+
+可选安装 `agent-runtime[postgres,s3]`，异步打开 `DatabaseSession` 后传给 Agent。
+完整事件存 PostgreSQL，冷日志可归档到 AWS S3 并使用指定 KMS Key 加密；
+运行、访问和模型用量事实独立保留，归档后仍可按用户和日期查询。
+[DDL](src/agent_runtime/storage/sql/001_sessions.sql)、[配置与部署](docs/database.md)、
+[无模型费用的数据库示例](examples/database_session.py)。

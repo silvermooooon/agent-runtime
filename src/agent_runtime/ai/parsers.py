@@ -110,6 +110,10 @@ class ResponsesParser:
             _push(self.stream, self.output, event, slot["index"], **fields)
 
     def feed(self, event):
+        usage = (event.get("response") or {}).get("usage")
+        if usage:
+            self.output["usage"] = _usage(usage)
+            self.output["usageStatus"] = "known"
         kind = event.get("type", "")
         if kind == "response.output_item.added":
             self._slot(event["output_index"], event["item"])
@@ -158,6 +162,7 @@ class ResponsesParser:
             self.output["content"] = [self.slots[index]["block"] for index in sorted(self.slots)]
             self.output["responseId"] = response.get("id")
             self.output["usage"] = _usage(response.get("usage") or {})
+            self.output["usageStatus"] = "known" if response.get("usage") else "unknown"
             tool_use = any(b["type"] == "toolCall" for b in self.output["content"])
             self.output["stopReason"] = (
                 "length" if incomplete else "toolUse" if tool_use else "stop"
@@ -182,6 +187,7 @@ class CompletionsParser:
             raise RuntimeError(str(event["error"]))
         if event.get("usage"):
             self.output["usage"] = _usage(event["usage"])
+            self.output["usageStatus"] = "known"
         for choice in event.get("choices", []):
             if choice.get("index", 0) != 0:
                 continue
@@ -365,6 +371,7 @@ class AnthropicParser:
                 raise ValueError("Anthropic stream contains incomplete content")
             self.output["stopReason"] = reasons[self.reason]
             self.output["usage"] = _usage(self.usage, anthropic=True)
+            self.output["usageStatus"] = "known" if self.usage else "unknown"
             self.terminal = True
         elif kind == "error":
             raise RuntimeError(str(event.get("error", event)))
