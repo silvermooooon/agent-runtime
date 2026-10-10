@@ -21,6 +21,7 @@ from agent_runtime import (
     SessionError,
     ToolRecoveryRequired,
 )
+from agent_runtime.sessions.base import replay_records
 from agent_runtime.sessions.local import encode
 from agent_runtime.transcript import current_tools
 
@@ -63,7 +64,9 @@ class ProjectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reopened.build_context(), agent.state.messages)
         self.assertEqual(reopened.snapshot["compaction"]["event_id"], event["id"])
         self.assertNotIn("messages", event["data"])
-        self.assertEqual({p.name for p in session.directory.iterdir()}, {"events.jsonl"})
+        self.assertEqual(
+            {p.name for p in session.directory.iterdir()}, {"events.jsonl", "checkpoint.json"}
+        )
         provider = FakeProvider(answer("next"))
         next_agent = Agent(session=reopened, tools=[add_tool()], stream_fn=provider)
         await next_agent.prompt("next request")
@@ -71,6 +74,80 @@ class ProjectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("old work summarized", json.dumps(provider.contexts[0]))
         request = [r for r in reopened.read_records() if r["type"] == "model_request"][-1]
         self.assertNotIn("llm_messages", request["data"])
+
+    async def test_checkpoint_replay_matches_legacy_replay_with_queues_and_subagents(self):
+        from copy import deepcopy
+
+        from agent_runtime.types import user_message
+
+        agent = await self.history(system_prompt="keep rules", tools=[add_tool()])
+        session = agent.session
+        await session.commit(
+            "subagent_created", parent_session_id="parent", name="helper", task="work"
+        )
+        await session.sync_queues([user_message("steer next")], [user_message("then follow up")])
+        keep = session.context_entries()[-2]["message_id"]
+        checkpoint = await session.compact("summary", keep)
+        await session.commit("run_interrupted", status="aborted", reason="test")
+        records = session.read_records()
+        legacy = deepcopy(records)
+        for record in legacy:
+            record.pop("checkpoint", None)
+        self.assertEqual(replay_records(legacy), session.snapshot)
+        self.assertEqual(replay_records(records[checkpoint["seq"] :]), session.snapshot)
+        self.assertEqual(self.session().snapshot, session.snapshot)
+        self.assertEqual(self.session().subagent_creation["name"], "helper")
+        self.assertTrue(self.session().has_runs)
+        self.assertNotIn("checkpoint", checkpoint["checkpoint"]["state"]["compaction"])
+
+    async def test_local_checkpoint_seeks_and_rebuilds_missing_or_stale_index(self):
+        agent = await self.history()
+        await agent.compact(summary="first checkpoint")
+        index = agent.session.directory / "checkpoint.json"
+        old_index = index.read_bytes()
+        agent.stream_function = FakeProvider(answer("new work"))
+        await agent.prompt("new request")
+        second = await agent.compact(summary="second checkpoint")
+        expected = agent.session.snapshot
+        # The indexed path must never parse any earlier event.
+        decode = json.loads
+
+        def decode_suffix(value, *args, **kwargs):
+            item = decode(value, *args, **kwargs)
+            if isinstance(item, dict) and "record" in item:
+                self.assertGreaterEqual(item["seq"], second["seq"])
+            return item
+
+        with patch("agent_runtime.sessions.local.json.loads", side_effect=decode_suffix):
+            self.assertEqual(self.session().snapshot, expected)
+        for content in (old_index, b"invalid index"):
+            index.write_bytes(content)
+            self.assertEqual(self.session().snapshot, expected)
+            self.assertEqual(json.loads(index.read_text())["event_id"], second["id"])
+        index.unlink()
+        self.assertEqual(self.session().snapshot, expected)
+        self.assertTrue(index.exists())
+        # An incomplete tail after the checkpoint is still repaired by the next append.
+        with agent.session.path.open("ab") as file:
+            file.write(b'{"incomplete":')
+        reopened = self.session()
+        await reopened.commit("queues", steering=[], follow_up=[])
+        self.assertEqual(self.session().snapshot, reopened.snapshot)
+
+    async def test_checkpoint_index_write_failure_keeps_durable_checkpoint(self):
+        agent = await self.history()
+        with patch("agent_runtime.sessions.local.os.replace", side_effect=OSError("index failed")):
+            checkpoint = await agent.compact(summary="durable even without index")
+        self.assertEqual(self.session().snapshot, checkpoint["checkpoint"]["state"])
+
+    async def test_checkpoint_version_and_missing_suffix_are_rejected(self):
+        agent = await self.history()
+        checkpoint = await agent.compact(summary="versioned")
+        checkpoint["checkpoint"]["version"] = 999
+        with self.assertRaisesRegex(SessionError, "Unsupported checkpoint"):
+            replay_records([checkpoint])
+        with self.assertRaisesRegex(SessionError, "must start"):
+            replay_records(agent.session.read_records()[1:2])
 
     async def test_history_node_uses_only_its_prefix(self):
         agent = await self.history()

@@ -42,9 +42,10 @@ class LocalSession(Session):
         self._tail_boundary = None
         self._records = []
         self._read_cursor = None
+        self._checkpoint_position = None
         self._reload()
 
-    def _read_file(self, after_seq=-1):
+    def _read_file(self, after_seq=-1, *, checkpoint=None):
         if self.path is None or not self.path.exists():
             self._read_cursor = None
             return [], 0, 0
@@ -53,9 +54,14 @@ class LocalSession(Session):
             stat = os.fstat(file.fileno())
             identity = (stat.st_dev, stat.st_ino)
             cursor = self._read_cursor
+            if checkpoint is not None:
+                seq, boundary = checkpoint["seq"], checkpoint["offset"]
+                if seq < 0 or boundary < 0 or boundary >= stat.st_size:
+                    raise SessionError("Invalid checkpoint position")
+                file.seek(boundary)
             # Journals are append-only. A cursor accelerates forward polling; full
-            # history, reopen, replacement and truncation still validate the full log.
-            if cursor and after_seq >= 0:
+            # history, replacement and truncation still validate the full log.
+            if checkpoint is None and cursor and after_seq >= 0:
                 previous_id, size, modified, count, offset = cursor
                 if (
                     identity == previous_id
@@ -87,6 +93,15 @@ class LocalSession(Session):
                     )
                     if not isinstance(record["id"], str) or not record["id"] or "/" in record["id"]:
                         raise ValueError("Invalid event ID")
+                    if checkpoint is not None and seq == checkpoint["seq"]:
+                        if record["id"] != checkpoint["event_id"] or "checkpoint" not in record:
+                            raise ValueError("Checkpoint index does not match journal")
+                    if record["type"] == "compaction" and "checkpoint" in record:
+                        self._checkpoint_position = {
+                            "seq": seq,
+                            "offset": boundary,
+                            "event_id": record["id"],
+                        }
                     if seq > after_seq:
                         records.append(record)
                 except (TypeError, ValueError, KeyError) as error:
@@ -96,14 +111,44 @@ class LocalSession(Session):
             self._read_cursor = (identity, stat.st_size, stat.st_mtime_ns, seq, boundary)
         return records, stat.st_size, boundary
 
+    @property
+    def _checkpoint_path(self):
+        return self.directory / "checkpoint.json"
+
+    def _write_checkpoint_index(self):
+        """Disposable position index. Failure only makes the next open read more history."""
+        if self._checkpoint_position is None:
+            return
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=self.directory, delete=False) as file:
+                temporary = Path(file.name)
+                file.write(encode(self._checkpoint_position))
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, self._checkpoint_path)
+        except OSError:
+            pass
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
     def _reload(self):
         if self.path is None:
             return
-        records, size, boundary = self._read_file()
+        try:
+            checkpoint = json.loads(self._checkpoint_path.read_text())
+            records, size, boundary = self._read_file(checkpoint=checkpoint)
+            if not records or records[0]["id"] != checkpoint["event_id"]:
+                raise SessionError("Missing indexed checkpoint")
+        except (OSError, ValueError, TypeError, KeyError, SessionError):
+            # A missing/stale index never replaces the authoritative journal.
+            self._checkpoint_position = None
+            records, size, boundary = self._read_file()
         state = replay_records(records)
         self._tail_boundary = boundary if boundary != size else None
-        self._state, self._seq = state, len(records)
-        # File-backed sessions retain the projection, not a duplicate full event log in RAM.
+        self._state, self._seq = state, records[-1]["seq"] + 1 if records else 0
+        self._write_checkpoint_index()
         self._records = []
 
     def read_records(self, after_seq=-1):
@@ -174,6 +219,7 @@ class LocalSession(Session):
             new_file = not self.path.exists()
             descriptor = os.open(self.path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
             with os.fdopen(descriptor, "ab") as file:
+                offset = file.tell()
                 file.write(line)
                 file.flush()
                 os.fsync(file.fileno())
@@ -184,5 +230,8 @@ class LocalSession(Session):
                         os.fsync(descriptor)
                     finally:
                         os.close(descriptor)
+            if record["type"] == "compaction" and "checkpoint" in record:
+                self._checkpoint_position = {"seq": seq, "offset": offset, "event_id": record["id"]}
+                self._write_checkpoint_index()
 
         await asyncio.to_thread(write)

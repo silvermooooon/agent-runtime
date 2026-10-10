@@ -282,5 +282,5 @@ Session 保存和恢复由 Runtime 直接调用，不依赖事件订阅。`messa
 可选安装 `agent-runtime[postgres,s3]`，异步打开 `DatabaseSession` 后传给 Agent。
 完整事件存 PostgreSQL，冷日志可归档到 AWS S3 并使用指定 KMS Key 加密；
 运行、访问和模型用量事实独立保留，归档后仍可按用户和日期查询。
-[DDL](src/agent_runtime/storage/sql/001_sessions.sql)、[配置与部署](docs/database.md)、
+[建表 DDL](src/agent_runtime/storage/sql/001_sessions.sql)、[checkpoint 迁移](src/agent_runtime/storage/sql/002_checkpoints.sql)、[配置与部署](docs/database.md)、
 [无模型费用的数据库示例](examples/database_session.py)。

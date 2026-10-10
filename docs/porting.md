@@ -60,7 +60,7 @@
 - 增加 provider/model 参数策略、过滤报告、环境配置与默认 Responses 入口。
 - 增加基于 Session 继承接口的本地事件记录、直接保存边界和 resume 入口；内存瞬时态合并在 LocalSession 中。该恢复协议为 Python SDK 扩展，见 [Session 设计](sessions.md)。
 - Agent 默认创建 LocalSession。开启文件存储时，持久内容必须能序列化为 JSON；原始工具结果在后处理前保存。
-- 压缩只追加摘要与保留边界，原消息不删除；内存上下文从单份完整日志重放。按 event ID 分叉时复制完整前缀到新 Session，不实现上游同文件分支树。见 [上下文与分叉](context.md)。
+- 压缩追加摘要、保留边界和可独立恢复的 checkpoint，原消息不删除；恢复从最近 checkpoint 重放尾部。位置索引不存状态正文。按 event ID 分叉时复制完整前缀到新 Session，不实现上游同文件分支树。见 [上下文与分叉](context.md)。
 - 自动压缩需要显式装配 `CompactionSettings`；摘要使用当前 Agent 的模型。上下文大小采用消息估算，未移植上游上下文溢出后的自动压缩重试。
 - 未指定 reasoning 时保留 provider 默认，而不主动发送 off。
 - `on_payload` 是观察副本的回调，不像 pi 那样允许任意覆盖整个请求体，避免绕过参数过滤。

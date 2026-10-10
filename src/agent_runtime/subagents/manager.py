@@ -53,10 +53,7 @@ class SubagentManager:
             raise RuntimeError("Subagent manager is closed or stopping")
 
     def _creation(self, session):
-        return next(
-            (r["data"] for r in session.read_records() if r["type"] == "subagent_created"),
-            None,
-        )
+        return session.subagent_creation
 
     def _child(self, task_id):
         if task_id not in self._children:
@@ -70,21 +67,11 @@ class SubagentManager:
     def _known_ids(self):
         ids = dict.fromkeys(self._children)
         # A spawn can have committed its child before the parent saved its tool result.
-        step = None
-        for record in self.parent.session.read_records():
-            if record["type"] == "model_request":
-                step = record["data"]["step_id"]
-            if record["type"] != "model_completed":
-                continue
-            for call in record["data"]["message"]["content"]:
-                if call["type"] == "toolCall" and call["name"] == "spawn_agent":
-                    # The step is the most recent model_request preceding this response.
-                    operation = (
-                        f"{self.parent.session.session_id}/{record['run_id']}/{step}/{call['id']}"
-                    )
-                    task_id = self.task_id(operation)
-                    if self._creation(self.session_factory(task_id)):
-                        ids[task_id] = None
+        for suffix in self.parent.session.spawn_operations:
+            operation = f"{self.parent.session.session_id}/{suffix}"
+            task_id = self.task_id(operation)
+            if self._creation(self.session_factory(task_id)):
+                ids[task_id] = None
         return ids
 
     async def spawn(self, name, task, *, operation_id):
@@ -152,7 +139,7 @@ class SubagentManager:
                 await agent.prompt(message)
             elif child.session.resumable:
                 await agent.resume()
-            elif not any(r["type"] == "run_started" for r in child.session.read_records()):
+            elif not child.session.has_runs:
                 await agent.prompt(creation["task"])
         finally:
             unsubscribe()

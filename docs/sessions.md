@@ -53,7 +53,7 @@ sessions/
 | run_completed / run_interrupted / run_resumed | 正常结束、停止／中断及恢复尝试 |
 | tool_retry_authorized / history_reset | 外部明确决定重试未知工具结果或放弃当前工作 |
 | compaction_started / compaction_failed | 摘要生成尝试、范围、配置和失败原因 |
-| compaction | 完整摘要、保留消息边界、估算 token 数及生成详情 |
+| compaction | 完整摘要、保留边界、生成详情，以及带版本的独立恢复 checkpoint |
 | context_replaced | 自定义请求准备改变上下文时，记录新的选择结果 |
 | session_forked | 新会话来源的 session ID 和 event ID；之前已复制完整前缀 |
 
@@ -108,11 +108,13 @@ else:
 | turn_completed | 复用已经保存的 finish_turn 决策 |
 | run_completed | 展示结果，resume 会提示没有未完成工作 |
 
-内存快照不需要持久化。恢复读取完整有效日志前缀并重建投影，包括已提交的上下文压缩记录。
-尚无存储日志的物理压缩、历史分页索引或定期快照加速。
+主动或自动压缩成功时，恢复状态随同一条压缩事件持久化。打开 LocalSession 时从最新 checkpoint 的
+文件偏移读取并重放尾部；没有可用定位索引时从头读取并重建索引。DB 恢复见 [数据库组件](database.md)。
+完整历史仍然保留，尚未实现日志分页读取。超长运行的输出仍属于恢复状态，checkpoint 不保证固定内存上限。
 业务查询可使用 `session.snapshot`、`session.revision` 和 `session.read_records(after_seq=...)`。
-`read_records(after_seq=...)` 每次主动读取文件；向前轮询时只校验、解析尚未读取的尾部，使用一个内存游标，不创建额外索引文件。约定已提交前缀只追加、不原地修改；文件替换、缩短或同长度修改会触发重新校验，完整历史查询始终重新校验。
-`snapshot`、`revision` 和上下文投影不随其他进程的写入自动更新；需要新的投影时重新打开 LocalSession。打开时仍会完整重放日志，没有消除超长会话的首次加载成本。
+`read_records(after_seq=...)` 每次主动读取文件；向前轮询使用内存游标，完整历史查询始终重新校验日志。
+`checkpoint.json` 是可重建的位置索引，不保存另一份状态。约定日志只追加，不原地修改已提交前缀。
+`snapshot`、`revision` 和上下文不随其他进程的写入自动更新；接管时重新打开 Session。
 
 提交时只复制状态的顶层容器，避免每条事件递归复制全部历史。内部 reducer 必须替换嵌套值，不能原地修改旧消息／工具结果；对外返回的快照与上下文仍是独立副本。
 
@@ -146,7 +148,8 @@ await agent.resume()
 
 一个 Session 同时只交给一个 Agent 执行，Agent 与 Session 实例限于同一事件循环使用。平台负责调度、Worker 接管，以及阻止失效 Worker 的外部写入。切换执行者时重新打开 Session，不复用旧执行者的内存投影。SSE 重连只恢复展示，不启动新的执行者。
 
-主执行协程顺序调用 `Session.commit()`；Session 子类只需实现 `_persist(seq, record)`、`read_records(after_seq)`，支持分叉时实现 `_import_records(records)`。
+主执行协程顺序调用 `Session.commit()`；Session 子类实现 `_persist(seq, record)` 和历史读取；异步存储覆写 `aread_records(after_seq)`、`asnapshot_at(event_id)`，
+同步历史接口明确拒绝网络 I/O。支持分叉时实现 `_import_records(records)`。
 
 - 工具任务只执行工具并交回进度和结果。主流程保存调用意图、原始结果、后处理结果，并更新 Agent / Session 的状态。
 - 工具可以并行执行；结果按完成顺序逐个提交，交给模型的 toolResult 消息仍按原工具计划排序。
@@ -167,7 +170,9 @@ await agent.resume()
 
 ## 本地日志恢复
 
-打开时读取完整有效记录前缀，只忽略没有换行的最后一个未完整片段；下一次追加前截断该片段。纯查询不会修改文件。中间损坏、完整记录校验失败、序号不连续、未知必需事件或不支持的格式均报错，不能静默丢弃。
+打开时校验 checkpoint 及其后续记录，没有可用索引时校验全部日志。只忽略没有换行的最后一个未完整片段，
+下一次追加前截断它。读取历史不会修改日志；打开会话可能重建位置索引。所读区间内的校验失败、序号不连续、
+未知必需事件或不支持的格式均报错。checkpoint 前的历史在完整历史读取时校验。
 
 文件持久化及目录同步按 POSIX 本地文件系统验证。部署方应配置保留数据的存储位置，并保证恢复时仍可访问日志；容器临时盘不能保证 Pod 删除后的恢复。
 

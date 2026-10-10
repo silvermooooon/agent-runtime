@@ -81,6 +81,9 @@ def empty_state():
         "compaction": None,
         "compaction_attempt": None,
         "origin": None,
+        "subagent_creation": None,
+        "has_runs": False,
+        "spawn_operations": [],
         "status": "idle",
         "phase": "idle",
         "run_id": None,
@@ -132,9 +135,23 @@ def tool_message(call, result, time):
 
 def reduce_record(state, record):
     kind, data = record["type"], record["data"]
-    if kind in ("subagent_created", "model_call_started", "model_call_finished"):
+    if kind == "compaction" and "checkpoint" in record:
+        checkpoint = record["checkpoint"]
+        if (
+            checkpoint["version"] != 1
+            or not isinstance(checkpoint["state"], dict)
+            or checkpoint["state"].keys() != empty_state().keys()
+        ):
+            raise ValueError("Unsupported checkpoint state")
+        state.clear()
+        state.update(deepcopy(checkpoint["state"]))
+    elif kind == "subagent_created":
+        if state["subagent_creation"] is None:
+            state["subagent_creation"] = deepcopy(data)
+    elif kind in ("model_call_started", "model_call_finished"):
         pass  # Composition metadata; never enters model context.
     elif kind == "run_started":
+        state["has_runs"] = True
         for key, incoming in data.get("queues", {}).items():
             for message in incoming:
                 if message not in state[key]:
@@ -189,6 +206,11 @@ def reduce_record(state, record):
             started={},
         )
     elif kind == "model_completed":
+        for call in data["message"]["content"]:
+            if call["type"] == "toolCall" and call["name"] == "spawn_agent":
+                state["spawn_operations"].append(
+                    f"{record['run_id']}/{state['step_id']}/{call['id']}"
+                )
         ids = [b["id"] for b in data["message"]["content"] if b["type"] == "toolCall"]
         if len(ids) != len(set(ids)):
             raise SessionError("Tool call IDs must be unique within one model response")
@@ -245,8 +267,12 @@ def reduce_record(state, record):
     elif kind == "run_resumed":
         state.update(status="running", error=None)
     elif kind == "history_reset":
+        composition = {
+            key: state[key] for key in ("subagent_creation", "has_runs", "spawn_operations")
+        }
         state.clear()
         state.update(empty_state())
+        state.update(composition)
         replace_messages(state, data["messages"], record, "messages")
     elif kind == "compaction":
         apply_compaction(state, record)
@@ -307,21 +333,43 @@ class Session(ABC):
             for key, message in zip(self._state["message_ids"], self._state["messages"])
         ]
 
-    def _prefix(self, event_id):
-        records = self.read_records()
+    async def aread_records(self, after_seq=-1):
+        """Explicit historical I/O; database backends override this method."""
+        return self.read_records(after_seq)
+
+    @staticmethod
+    def _select_prefix(records, event_id):
         for index, record in enumerate(records):
             if record["id"] == event_id:
                 return records[: index + 1]
         raise SessionError(f"Unknown event ID: {event_id}")
 
+    def _prefix(self, event_id):
+        return self._select_prefix(self.read_records(), event_id)
+
     def snapshot_at(self, event_id):
         return replay_records(self._prefix(event_id))
+
+    async def asnapshot_at(self, event_id):
+        return replay_records(self._select_prefix(await self.aread_records(), event_id))
+
+    @property
+    def subagent_creation(self):
+        return deepcopy(self._state["subagent_creation"])
+
+    @property
+    def spawn_operations(self):
+        return list(self._state["spawn_operations"])
+
+    @property
+    def has_runs(self):
+        return self._state["has_runs"]
 
     async def fork_into(self, event_id, target):
         """Copy a complete prefix into an empty independent Session, preserving checkpoints."""
         if target is self or target.session_id == self.session_id:
             raise SessionError("Fork needs a different session ID")
-        records = self._prefix(event_id)
+        records = self._select_prefix(await self.aread_records(), event_id)
         records.append(
             {
                 "id": uuid4().hex,
@@ -379,6 +427,9 @@ class Session(ABC):
                 for key, value in self._state.items()
             }
             reduce_record(candidate, record)
+            if kind == "compaction":
+                # A single durable event publishes both the summary and its recovery state.
+                record["checkpoint"] = {"version": 1, "state": deepcopy(candidate)}
         except (TypeError, ValueError, KeyError) as error:
             raise SessionError(f"Invalid session record {kind}: {error}") from error
         task = asyncio.create_task(self._persist(self._seq, record))
@@ -572,7 +623,10 @@ class Session(ABC):
 
 def replay_records(records):
     state, seen = empty_state(), set()
-    for seq, record in enumerate(records):
+    start_seq = records[0]["seq"] if records else 0
+    if start_seq and not (records[0]["type"] == "compaction" and "checkpoint" in records[0]):
+        raise SessionError("Journal suffix must start with a compaction checkpoint")
+    for seq, record in enumerate(records, start_seq):
         if record["seq"] != seq or record["id"] in seen:
             raise SessionError("Invalid event sequence or duplicate event ID")
         seen.add(record["id"])

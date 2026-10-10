@@ -131,7 +131,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.run_agent()
         reopened = await self.open("main")
         self.assertEqual(reopened.snapshot, self.session.snapshot)
-        self.assertEqual(reopened.read_records(), self.session.read_records())
+        self.assertEqual((await reopened.aread_records()), (await self.session.aread_records()))
         self.assertEqual((await self.open("main", tenant="other")).revision, 0)
         usage = await self.rows("agent_model_usage")
         self.assertEqual(len(usage), 1)
@@ -141,12 +141,12 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_archive_restore_then_append_and_fork_no_double_usage(self):
         await self.run_agent()
-        records = self.session.read_records()
+        records = await self.session.aread_records()
         archived = await self.store.archive_session("org", "main")
         self.assertEqual(archived, len(records))
         self.assertEqual(await self.rows("agent_session_events"), [])
         reopened = await self.open("main")
-        self.assertEqual(reopened.read_records(), records)
+        self.assertEqual((await reopened.aread_records()), records)
         child = await reopened.fork(records[-1]["id"], session_id="fork")
         self.assertEqual(len(await self.rows("agent_model_usage")), 1)
         self.assertEqual(child.snapshot["messages"], reopened.snapshot["messages"])
@@ -156,8 +156,71 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mixed.snapshot, reopened.snapshot)
         self.assertEqual(
             await self.store.read_records("org", "main", len(records) - 1),
-            reopened.read_records(len(records) - 1),
+            await reopened.aread_records(len(records) - 1),
         )
+
+    async def test_checkpoint_restores_without_old_archives_or_history_cache(self):
+        from unittest.mock import patch
+
+        agent = await self.run_agent()
+        before = self.session.snapshot
+        old_event = (await self.session.aread_records())[-1]["id"]
+        # Archive pre-checkpoint history into separate objects, then commit a hot checkpoint.
+        await self.store.archive_session("org", "main")
+        checkpoint = await agent.compact(summary="preserve the user's goal")
+        await self.run_agent()
+        expected = self.session.snapshot
+        with patch.object(
+            self.store.archive, "get", side_effect=AssertionError("old archive read")
+        ):
+            reopened = await self.open("main")
+            self.assertEqual(reopened.snapshot, expected)
+            self.assertEqual(reopened.revision, self.session.revision)
+            self.assertFalse(hasattr(reopened, "_records"))
+            at_checkpoint = await reopened.asnapshot_at(checkpoint["id"])
+            self.assertEqual(at_checkpoint, checkpoint["checkpoint"]["state"])
+        self.assertEqual(await reopened.asnapshot_at(old_event), before)
+        branch = await reopened.fork(checkpoint["id"], session_id="checkpoint-branch")
+        self.assertEqual(branch.build_context(), at_checkpoint["messages"])
+        self.assertEqual((await self.open("checkpoint-branch")).snapshot, branch.snapshot)
+        with self.assertRaisesRegex(SessionError, "aread_records"):
+            reopened.read_records()
+
+    async def test_cold_checkpoint_reads_only_overlapping_archives(self):
+        from unittest.mock import patch
+
+        agent = await self.run_agent()
+        await self.store.archive_session("org", "main")
+        checkpoint = await agent.compact(summary="checkpoint in S3")
+        await self.run_agent()
+        await self.store.archive_session("org", "main")
+        get = self.store.archive.get
+        fetched = []
+
+        async def tracked(manifest):
+            self.assertGreaterEqual(manifest["end_seq"], checkpoint["seq"])
+            fetched.append(manifest)
+            return await get(manifest)
+
+        with patch.object(self.store.archive, "get", side_effect=tracked):
+            restored = await self.open("main")
+            self.assertEqual(restored.snapshot, self.session.snapshot)
+        self.assertTrue(fetched)
+        self.assertEqual(len(await self.rows("agent_session_checkpoints")), 1)
+        self.assertEqual(len(await self.rows("agent_model_usage")), 2)
+
+    async def test_checkpoint_and_index_rollback_together(self):
+        from unittest.mock import patch
+
+        await self.run_agent()
+        old_revision, old_state = self.session.revision, self.session.snapshot
+        with patch("agent_runtime.storage.postgres.project", side_effect=RuntimeError("rollback")):
+            with self.assertRaises(SessionError):
+                await self.session.compact("failed publication", None)
+        self.assertEqual(await self.rows("agent_session_checkpoints"), [])
+        reopened = await self.open("main")
+        self.assertEqual(reopened.revision, old_revision)
+        self.assertEqual(reopened.snapshot, old_state)
 
     async def test_audit_idempotence_and_stats_survive_archive(self):
         await self.run_agent()
@@ -317,9 +380,13 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fork_preserves_event_ids_and_future_resume_counts_only_new_calls(self):
         await self.run_agent()
-        request = next(r for r in self.session.read_records() if r["type"] == "model_request")
+        request = next(
+            r for r in (await self.session.aread_records()) if r["type"] == "model_request"
+        )
         child = await self.session.fork(request["id"], session_id="branch")
-        self.assertEqual(child.read_records()[0]["id"], self.session.read_records()[0]["id"])
+        self.assertEqual(
+            (await child.aread_records())[0]["id"], (await self.session.aread_records())[0]["id"]
+        )
         await Agent(model=MODEL, session=child, stream_fn=self.provider()).resume()
         self.assertEqual(len(await self.rows("agent_model_usage")), 2)
 
@@ -327,10 +394,10 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.run_agent()
         target = await self.open("branch")
         await self.run_agent(target)
-        before = target.read_records()
+        before = await target.aread_records()
         with self.assertRaises(SessionError):
-            await self.session.fork_into(self.session.read_records()[-1]["id"], target)
-        self.assertEqual((await self.open("branch")).read_records(), before)
+            await self.session.fork_into((await self.session.aread_records())[-1]["id"], target)
+        self.assertEqual(await (await self.open("branch")).aread_records(), before)
 
     async def test_model_failure_with_reported_usage_is_retained(self):
         message = answer(reason="error")

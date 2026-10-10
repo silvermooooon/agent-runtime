@@ -6,19 +6,21 @@ Python 3.11–3.13，DDL 使用 PostgreSQL 14+ 支持的语法；CI 验证 Postg
 
 ## DDL 与部署
 
-版本化 DDL 随包发布在 `src/agent_runtime/storage/sql/001_sessions.sql`。
-部署时显式执行一次，例如 `psql "$AGENT_DB_URL" -f .../001_sessions.sql`。
+版本化 DDL 随包发布在 `src/agent_runtime/storage/sql/`。
+新部署依次执行 `001_sessions.sql`、`002_checkpoints.sql`；已安装 001 的部署只执行 002。
+例如 `psql "$AGENT_DB_URL" -f .../002_checkpoints.sql`。
 也可以显式调用 `await store.install_schema()`。正常连接和打开 Session 不会执行 DDL。
 数据库账号需有目标 schema 的权限；schema 通过 PostgreSQL 连接串 options/search_path 配置。
 DDL 不使用 `IF NOT EXISTS` 掩盖结构不匹配，已安装时重复执行会失败。
 
-六张表：
+七张表：
 
 | 表 | 内容 | 事件冷化后 |
 |---|---|---|
 | agent_sessions | 租户、会话、创建/更新时间、next_seq、metadata | 保留 |
 | agent_session_events | seq、event_id、完整 record、metadata | 已归档区间删除 |
 | agent_session_archives | 序号区间、S3 URI、版本、SHA-256、格式版本、metadata | 保留 |
+| agent_session_checkpoints | checkpoint 的 seq、event_id；不保存状态正文 | 保留 |
 | agent_runs | 用户运行身份、主任务归属、来源、状态与时间 | 保留 |
 | agent_audit_events | 实际执行者、访问对象、行为、结果与时间 | 保留 |
 | agent_model_usage | 每次模型调用尝试、用户归属、token 与已知/未知状态 | 保留 |
@@ -59,12 +61,21 @@ finally:
 一个服务进程共享一个连接池，不为每个 Session 创建连接池。
 
 `DatabaseSession(...)` 构造器仅用于全新会话，不执行网络 I/O；已有会话必须 `await open()`。
-同步 `read_records()`、`snapshot_at()`、`build_context()` 读取已加载视图；运行提交会更新它。
-观察其他 Worker 的新事件时调用 `await session.read_latest_records(after_seq)`，不会修改当前执行状态。
+同步 `build_context()`、`snapshot` 读取当前执行状态。历史记录使用 `await session.aread_records(after_seq)`，
+历史状态使用 `await session.asnapshot_at(event_id)`；DB Session 的同步历史接口会提示使用异步接口。
+观察其他 Worker 的新事件也可调用 `await session.read_latest_records(after_seq)`，不会修改当前执行状态。
 接管时重新 `open()`，不要把观察到的新事件直接灌入活动 Agent。
 
-第一版在打开会话时加载完整冷热日志，并保留内存事件视图以兼容现有同步历史接口。
-这会产生与会话历史大小成比例的内存及首次读取成本；没有另存数据库快照或第二套持久化上下文。
+打开时查找最近的压缩 checkpoint，只读取该事件到日志末尾，推算后释放事件列表。
+内存保留上下文、运行阶段、队列、运行输出和子 Agent 关联等恢复状态，不保留完整日志缓存。
+没有 checkpoint 的旧会话从头重放；主动或自动压缩成功后自动生成 checkpoint，无额外配置。
+状态正文放在压缩事件的 `checkpoint` 字段中，定位表和事件在同一事务提交。
+定位表在冷化后保留，恢复只下载与所需区间相交的 S3 对象；gzip 对象内部仍需整块解压。
+
+历史状态查询选择目标节点及其之前最近的 checkpoint。普通事件冷化后，仅凭 event ID 定位需读取历史，
+因为没有为每条冷事件维护额外索引；热事件和 checkpoint 可直接定位。完整历史查询和独立分叉仍按需加载历史。
+checkpoint 不删除旧数据，也不执行模型或工具。工具、回调和策略由宿主重新装配。
+当前恢复仍一次性加载 checkpoint 后的区间，未实现分页重放；长时间不压缩或单次运行输出很大时，内存仍可能较大。
 所有 PostgreSQL I/O 为异步，S3 SDK 调用在线程中执行。
 
 ## 审查与统计

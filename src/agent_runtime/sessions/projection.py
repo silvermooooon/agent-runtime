@@ -42,7 +42,7 @@ def apply_compaction(state, record):
         + data["summary"]
     )
     summary["timestamp"] = record["time"]
-    # The system/tool checkpoint is derived from prior records, never stored twice.
+    # Preserve the effective system message in the compacted context.
     replace_messages(state, [system] if system else [], record, "system")
     append_messages(state, [summary], record, "summary")
     summary_id = state["message_ids"][-1]

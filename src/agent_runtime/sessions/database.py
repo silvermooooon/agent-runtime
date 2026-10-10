@@ -1,9 +1,8 @@
-"""Optional PostgreSQL session, opened asynchronously with an in-memory journal view."""
+"""Optional PostgreSQL session, retaining only the current recovery state."""
 
-from copy import deepcopy
 from uuid import uuid4
 
-from .base import Session, replay_records, saved_options
+from .base import Session, SessionError, replay_records, saved_options
 
 
 class DatabaseSession(Session):
@@ -17,32 +16,39 @@ class DatabaseSession(Session):
         self.store = store
         self.tenant_id = tenant_id
         self.audit_context = audit_context
-        self._records = []
 
     @classmethod
     async def open(cls, store, **kwargs):
         session = cls(store, **kwargs)
-        records = await store.read_records(session.tenant_id, session.session_id)
+        records = await store.read_recovery_records(session.tenant_id, session.session_id)
         session._state = replay_records(records)
-        session._seq = len(records)
-        session._records = records
+        session._seq = records[-1]["seq"] + 1 if records else 0
         return session
 
     def read_records(self, after_seq=-1):
-        """Loaded view, with this writer's commits. No synchronous network I/O."""
-        return deepcopy(self._records[after_seq + 1 :])
+        raise SessionError("Database history requires await session.aread_records()")
+
+    def snapshot_at(self, event_id):
+        raise SessionError("Database history requires await session.asnapshot_at(event_id)")
+
+    async def aread_records(self, after_seq=-1):
+        """Read storage on demand without retaining history or changing execution state."""
+        return await self.store.read_records(self.tenant_id, self.session_id, after_seq)
 
     async def read_latest_records(self, after_seq=-1):
-        """Read current storage without changing this execution's projection."""
-        return await self.store.read_records(self.tenant_id, self.session_id, after_seq)
+        return await self.aread_records(after_seq)
+
+    async def asnapshot_at(self, event_id):
+        records = await self.store.read_recovery_records(
+            self.tenant_id, self.session_id, event_id=event_id
+        )
+        return replay_records(records)
 
     async def _persist(self, seq, record):
         await self.store.append(self, record)
-        self._records.append(deepcopy(record))
 
     async def _import_records(self, records):
         await self.store.import_records(self.tenant_id, self.session_id, records)
-        self._records = deepcopy(records)
 
     async def fork(self, event_id, *, session_id=None, audit_context=None):
         target = DatabaseSession(

@@ -27,9 +27,7 @@ async def project(conn, session, record):
     context = session.audit_context
     at = instant(record["time"])
     if kind in ("run_started", "run_resumed"):
-        creation = next(
-            (r["data"] for r in session.read_records() if r["type"] == "subagent_created"), None
-        )
+        creation = session.subagent_creation
         if creation and not session.snapshot["origin"]:
             prefix = creation["parent_session_id"] + "/"
             parent_run = creation["operation_id"].partition(prefix)[2].partition("/")[0]

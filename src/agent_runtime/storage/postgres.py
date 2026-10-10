@@ -42,9 +42,10 @@ class PostgresStore:
 
     async def install_schema(self):
         """Explicit deployment action; not called by connect/open. Fails if already installed."""
-        ddl = files("agent_runtime.storage").joinpath("sql/001_sessions.sql").read_text()
         async with self.pool.connection() as conn:
-            await conn.execute(ddl)
+            for name in ("001_sessions.sql", "002_checkpoints.sql"):
+                ddl = files("agent_runtime.storage").joinpath(f"sql/{name}").read_text()
+                await conn.execute(ddl)
 
     async def _ensure(self, conn, tenant, sid):
         await conn.execute(
@@ -72,6 +73,12 @@ class PostgresStore:
             "VALUES (%s,%s,%s,%s,%s)",
             (tenant, sid, record["seq"], record["id"], Json(record)),
         )
+        if record["type"] == "compaction" and "checkpoint" in record:
+            await conn.execute(
+                "INSERT INTO agent_session_checkpoints (tenant_id,session_id,seq,event_id) "
+                "VALUES (%s,%s,%s,%s)",
+                (tenant, sid, record["seq"], record["id"]),
+            )
 
     async def import_records(self, tenant, sid, records):
         # Historical copies are not new access or usage and never project audit facts.
@@ -88,6 +95,13 @@ class PostgresStore:
                 await self._insert_event(conn, tenant, sid, record)
 
     async def read_records(self, tenant, sid, after_seq=-1):
+        return await self._read_records(tenant, sid, after_seq=after_seq)
+
+    async def read_recovery_records(self, tenant, sid, *, event_id=None):
+        """Read the nearest checkpoint and suffix, or legacy history without a checkpoint."""
+        return await self._read_records(tenant, sid, recovery=True, event_id=event_id)
+
+    async def _read_records(self, tenant, sid, *, after_seq=-1, recovery=False, event_id=None):
         async with self.pool.connection() as conn:
             await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             row = await (
@@ -97,30 +111,69 @@ class PostgresStore:
                 )
             ).fetchone()
             if row is None:
+                if event_id is not None:
+                    raise SessionError(f"Unknown event ID: {event_id}")
                 return []
-            archives = await (
-                await conn.execute(
-                    "SELECT * FROM agent_session_archives WHERE tenant_id=%s AND session_id=%s "
-                    "AND end_seq>%s ORDER BY start_seq",
-                    (tenant, sid, after_seq),
-                )
-            ).fetchall()
-            hot = await (
-                await conn.execute(
-                    "SELECT record FROM agent_session_events "
-                    "WHERE tenant_id=%s AND session_id=%s "
-                    "AND seq>%s ORDER BY seq",
-                    (tenant, sid, after_seq),
-                )
-            ).fetchall()
+            end_seq = row["next_seq"] - 1
+            if event_id is not None:
+                target = await (
+                    await conn.execute(
+                        "SELECT seq FROM agent_session_events "
+                        "WHERE tenant_id=%s AND session_id=%s AND event_id=%s "
+                        "UNION ALL SELECT seq FROM agent_session_checkpoints "
+                        "WHERE tenant_id=%s AND session_id=%s AND event_id=%s LIMIT 1",
+                        (tenant, sid, event_id, tenant, sid, event_id),
+                    )
+                ).fetchone()
+                if target is None:
+                    # Ordinary archived event IDs have no retained per-event index.
+                    # Resolve them by explicitly reading history after releasing this connection.
+                    end_seq = None
+                else:
+                    end_seq = target["seq"]
+            if end_seq is not None:
+                if recovery:
+                    checkpoint = await (
+                        await conn.execute(
+                            "SELECT seq FROM agent_session_checkpoints "
+                            "WHERE tenant_id=%s AND session_id=%s AND seq<=%s "
+                            "ORDER BY seq DESC LIMIT 1",
+                            (tenant, sid, end_seq),
+                        )
+                    ).fetchone()
+                    after_seq = checkpoint["seq"] - 1 if checkpoint else -1
+                archives = await (
+                    await conn.execute(
+                        "SELECT * FROM agent_session_archives WHERE tenant_id=%s AND session_id=%s "
+                        "AND end_seq>%s AND start_seq<=%s ORDER BY start_seq",
+                        (tenant, sid, after_seq, end_seq),
+                    )
+                ).fetchall()
+                hot = await (
+                    await conn.execute(
+                        "SELECT record FROM agent_session_events "
+                        "WHERE tenant_id=%s AND session_id=%s AND seq>%s AND seq<=%s ORDER BY seq",
+                        (tenant, sid, after_seq, end_seq),
+                    )
+                ).fetchall()
+        if end_seq is None:
+            from ..sessions.base import Session
+
+            prefix = Session._select_prefix(await self.read_records(tenant, sid), event_id)
+            start = next(
+                (i for i in range(len(prefix) - 1, -1, -1) if "checkpoint" in prefix[i]), 0
+            )
+            return prefix[start:]
         records = []
         for manifest in archives:
             if self.archive is None:
                 raise SessionError("S3 archive reader is required for this session")
-            records.extend(r for r in await self.archive.get(manifest) if r["seq"] > after_seq)
+            records.extend(
+                r for r in await self.archive.get(manifest) if after_seq < r["seq"] <= end_seq
+            )
         records.extend(r["record"] for r in hot)
         records.sort(key=lambda r: r["seq"])
-        if [r["seq"] for r in records] != list(range(after_seq + 1, row["next_seq"])):
+        if [r["seq"] for r in records] != list(range(after_seq + 1, end_seq + 1)):
             raise SessionError("Missing or overlapping journal events")
         return records
 
