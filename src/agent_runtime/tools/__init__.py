@@ -1,4 +1,4 @@
-"""Bundled pi coding tools. Importing this module does not enable any tools on an Agent."""
+"""Bundled tools. Importing this module does not enable any tools on an Agent."""
 
 from pathlib import Path
 
@@ -7,6 +7,7 @@ from .bash import BashOperations, LocalBashOperations, create_bash_tool
 from .edit import create_edit_tool
 from .operations import EditOperations, LocalFileOperations, ReadOperations, WriteOperations
 from .read import create_read_tool
+from .web_search import create_web_search_tool
 from .write import create_write_tool
 
 
@@ -29,6 +30,7 @@ def create_coding_tools(
 
 __all__ = [
     "create_coding_tools",
+    "create_web_search_tool",
     "create_read_tool",
     "create_bash_tool",
     "create_edit_tool",

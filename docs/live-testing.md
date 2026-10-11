@@ -165,3 +165,21 @@ req_848e8bc9cbea47f9a254cae595c44080
 req_0379820137d64622b2f840fa0e3643d0
 req_296741cefca94a2ebb92bc5be8a858af
 ```
+
+## 2026-10-12 Responses 原生网页搜索实测通过
+
+```bash
+uv run --env-file .env python tests/live_web_search.py --live
+```
+
+固定官方 Responses API 和 `gpt-6-luna`，限定一次模型请求、最多 2048 输出 token，
+网络操作超时 45 秒、整体执行上限 90 秒。模型凭据和代理从项目 `.env` 加载。
+
+本次真实请求 HTTP 200，服务端返回 2 个 `web_search_call` 输出项和 1 个 URL 引用。
+验证搜索进度和文本增量经 SDK 事件链传递；完整原始输出和引用落入 LocalSession，
+重新打开会话后与执行时的最终助手消息一致。未使用 MockTransport 或替代模型。
+普通工具混用、未完成请求恢复、压缩 checkpoint 和移除工具由离线测试覆盖。
+
+```text
+req_1e7caf9758e448a3b8e46161500c69b4
+```

@@ -10,7 +10,15 @@ from dataclasses import asdict, dataclass, replace
 from uuid import uuid4
 
 from ..transcript import tool_declaration
-from ..types import AgentToolResult, Model, ParameterPolicy, default_convert_to_llm, timestamp
+from ..types import (
+    AgentTool,
+    AgentToolResult,
+    Model,
+    ParameterPolicy,
+    ProviderTool,
+    default_convert_to_llm,
+    timestamp,
+)
 from .projection import append_messages, apply_compaction, replace_messages
 
 
@@ -87,7 +95,12 @@ def saved_options(options):
 
 
 def tool_records(tools):
-    return [{**tool_declaration(t), "replay": t.replay, "version": t.version} for t in tools]
+    return [
+        tool_declaration(t)
+        if isinstance(t, ProviderTool)
+        else {**tool_declaration(t), "replay": t.replay, "version": t.version}
+        for t in tools
+    ]
 
 
 def empty_state():
@@ -619,7 +632,9 @@ class Session(ABC):
             if call["id"] in self._state["results"]:
                 continue
             tool = current.get(call["name"])
-            if not tool or tool_records([tool])[0] != previous.get(call["name"]):
+            if not isinstance(tool, AgentTool) or tool_records([tool])[0] != previous.get(
+                call["name"]
+            ):
                 raise SessionError(f"Restore the original tool definition/version: {call['name']}")
             if (
                 call["id"] in self._state["started"]

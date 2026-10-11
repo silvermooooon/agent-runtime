@@ -129,9 +129,18 @@ class AgentTool:
 
 
 @dataclass
+class ProviderTool:
+    """Tool executed by a provider, declared alongside locally executed AgentTools."""
+
+    name: str
+    api: str
+    options: dict[str, Any]
+
+
+@dataclass
 class AgentContext:
     messages: list[Message] = field(default_factory=list)
-    tools: list[AgentTool] = field(default_factory=list)
+    tools: list[AgentTool | ProviderTool] = field(default_factory=list)
 
 
 def default_convert_to_llm(messages: list[Message]) -> list[Message]:

@@ -123,6 +123,18 @@ await agent.prompt("检查并修改这个工作目录中的代码。")
 
 `create_coding_tools` 返回 `read`、`bash`、`edit`、`write`。也可以分别使用 `create_read_tool` 等工厂，只启用需要的工具。工具参数、替换执行后端、审批与恢复说明见 [内置工具](docs/tools.md)，完整示例见 [coding_tools.py](examples/coding_tools.py)。
 
+Responses 原生网页搜索同样需要显式装配，不传就不启用：
+
+```python
+from agent_runtime.tools import create_web_search_tool
+
+agent = Agent(tools=[create_web_search_tool()])
+await agent.prompt("搜索 OpenAI 官方 Responses API 文档，并引用来源。")
+```
+
+搜索由 OpenAI 服务端执行，SDK 保留搜索进度、完整输出和引用，并沿用 Session 恢复。
+参数和执行边界见 [网页搜索](docs/web-search.md)，示例见 [web_search.py](examples/web_search.py)。
+
 MCP 工具由独立的 `agent_runtime.mcp` 模块提供。平台传入已发现、已选择的 schema，`assemble_tools` 根据 `type: builtin | mcp` 组装；MCP 业务名称为 `server.tool`。支持 Streamable HTTP、stdio、静态和动态请求头，沿用现有审批及 Session 恢复。完整用法及边界见 [MCP 调用](docs/mcp.md)，无需 API Key 的真实 stdio 示例：
 
 ```bash

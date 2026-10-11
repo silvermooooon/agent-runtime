@@ -37,6 +37,8 @@ def estimate_message_tokens(message):
             chars += 4800
         elif block["type"] == "toolCall":
             chars += len(block["name"]) + len(json.dumps(block["arguments"], separators=(",", ":")))
+        elif block["type"] == "webSearchCall":
+            chars += len(json.dumps(block, ensure_ascii=False, separators=(",", ":")))
     return math.ceil(chars / 4)
 
 

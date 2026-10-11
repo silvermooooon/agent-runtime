@@ -2,7 +2,7 @@
 
 from copy import deepcopy
 
-from .types import AgentContext, AgentTool, Message, timestamp
+from .types import AgentContext, AgentTool, Message, ProviderTool, timestamp
 
 
 def content_text(content) -> str:
@@ -13,7 +13,13 @@ def content_text(content) -> str:
     )
 
 
-def tool_declaration(tool: AgentTool) -> dict:
+def tool_declaration(tool: AgentTool | ProviderTool) -> dict:
+    if isinstance(tool, ProviderTool):
+        return {
+            "name": tool.name,
+            "api": tool.api,
+            "providerTool": deepcopy(tool.options),
+        }
     return {
         "name": tool.name,
         "description": tool.description,

@@ -71,6 +71,8 @@ def serialize_conversation(messages):
                 parts.append(f"[Tool call]: {block['name']}({block['arguments']!r})")
             elif block.get("type") == "thinking":
                 parts.append(f"[Assistant thinking]: {block.get('thinking', '')}")
+            elif block.get("type") == "webSearchCall":
+                parts.append(f"[Web search]: {block.get('action', {})!r}")
     return "\n\n".join(parts)
 
 

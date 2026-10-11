@@ -47,6 +47,9 @@ def _tool_output(message, api):
 
 
 def build_payload(model, context, parameters):
+    for tool in current_tools(context.messages):
+        if "providerTool" in tool and tool["api"] != model.api:
+            raise ValueError(f"Tool {tool['name']} requires API {tool['api']}")
     if model.api == "openai-responses":
         return encode_tool_names(_responses(model, context, deepcopy(parameters)))
     if model.api == "openai-completions":
@@ -112,7 +115,12 @@ def _responses(model, context, parameters):
     result = {"model": model.id, "stream": True, "store": False, "input": items, **parameters}
     tools = current_tools(context.messages)
     if tools:
-        result["tools"] = [{"type": "function", **t, "strict": False} for t in tools]
+        result["tools"] = [
+            deepcopy(t["providerTool"])
+            if "providerTool" in t
+            else {"type": "function", **t, "strict": False}
+            for t in tools
+        ]
     return result
 
 

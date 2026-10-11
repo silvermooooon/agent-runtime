@@ -63,6 +63,9 @@ class ResponsesParser:
                 "arguments": {},
             }
             event = "toolcall_start"
+        elif kind == "web_search_call":
+            block = {**deepcopy(item), "type": "webSearchCall"}
+            event = "web_search_start"
         else:
             raise ValueError(f"Responses output type not implemented: {kind}")
         position = len(self.output["content"])
@@ -91,11 +94,26 @@ class ResponsesParser:
                     **({"phase": item["phase"]} if item.get("phase") else {}),
                 }
             )
+            annotations, offset = [], 0
+            for part in item.get("content", []):
+                for annotation in part.get("annotations", []):
+                    annotation = deepcopy(annotation)
+                    for key in ("start_index", "end_index"):
+                        if key in annotation:
+                            annotation[key] += offset
+                    annotations.append(annotation)
+                offset += len(part.get("text", part.get("refusal", "")))
+            if annotations:
+                block["annotations"] = annotations
             event, fields = "text_end", {"content": block["text"]}
         elif item["type"] == "reasoning":
             block["thinking"] = "\n\n".join(c.get("text", "") for c in item.get("summary", []))
             block["thinkingSignature"] = json.dumps(item)
             event, fields = "thinking_end", {"content": block["thinking"]}
+        elif item["type"] == "web_search_call":
+            block.update(deepcopy(item))
+            block["type"] = "webSearchCall"
+            event, fields = "web_search_end", {"item": deepcopy(block)}
         else:
             raw = item.get("arguments", slot["json"])
             try:
@@ -117,6 +135,23 @@ class ResponsesParser:
         kind = event.get("type", "")
         if kind == "response.output_item.added":
             self._slot(event["output_index"], event["item"])
+        elif kind in (
+            "response.web_search_call.in_progress",
+            "response.web_search_call.searching",
+            "response.web_search_call.completed",
+        ):
+            slot = self._slot(
+                event["output_index"],
+                {"type": "web_search_call", "id": event["item_id"], "status": "in_progress"},
+            )
+            slot["block"]["status"] = kind.rsplit(".", 1)[-1]
+            _push(
+                self.stream,
+                self.output,
+                "web_search_update",
+                slot["index"],
+                item=deepcopy(slot["block"]),
+            )
         elif kind in (
             "response.output_text.delta",
             "response.refusal.delta",

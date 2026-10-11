@@ -33,6 +33,7 @@ from .types import (
     Model,
     OperationAborted,
     ParameterPolicy,
+    ProviderTool,
     assistant_message,
     user_message,
 )

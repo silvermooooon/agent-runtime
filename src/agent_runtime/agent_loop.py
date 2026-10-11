@@ -14,6 +14,7 @@ from .types import (
     AbortSignal,
     AgentContext,
     AgentLoopConfig,
+    AgentTool,
     AgentToolResult,
     maybe_await,
     timestamp,
@@ -364,7 +365,9 @@ def _error_result(text):
 
 
 async def _prepare_tool(context, assistant, call, config, signal):
-    tool = next((t for t in context.tools if t.name == call["name"]), None)
+    tool = next(
+        (t for t in context.tools if isinstance(t, AgentTool) and t.name == call["name"]), None
+    )
     if tool is None:
         return None, None, _error_result(f"Tool {call['name']} not found")
     try:
@@ -483,7 +486,9 @@ async def run_tool_call(
 
 async def _execute_tools(context, assistant, calls, config, signal, emit):
     sequential = config.tool_execution == "sequential" or any(
-        t.execution_mode == "sequential" and any(c["name"] == t.name for c in calls)
+        isinstance(t, AgentTool)
+        and t.execution_mode == "sequential"
+        and any(c["name"] == t.name for c in calls)
         for t in context.tools
     )
     truncated = assistant["stopReason"] == "length"

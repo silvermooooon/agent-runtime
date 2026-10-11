@@ -65,6 +65,7 @@
 - 未指定 reasoning 时保留 provider 默认，而不主动发送 off。
 - `on_payload` 是观察副本的回调，不像 pi 那样允许任意覆盖整个请求体，避免绕过参数过滤。
 - Responses 完整原始 output 保存在 `responseOutput`，用于同 provider/model 的无状态 reasoning 重放。流式工具参数不完整时不交给执行器。
+- Responses 原生 `web_search` 通过 `ProviderTool` 显式装配，搜索进度和引用由协议层适配，沿用现有 Session 日志；服务端搜索不走本地工具执行及审批钩子，见 [网页搜索](web-search.md)。
 - 未知模型允许使用已注册 provider 的默认协议；模型能力保留未知状态，不按名字猜测。
 - 四个内置工具的默认参数和主要行为参考上述固定版本；工具必须显式装配。图片后端使用 Pillow，diff 使用 difflib，因此编码结果和 diff 分块不保证逐字节等同于上游。
 - bash 环境是本 SDK 的有意差异：默认从最小变量集合开始，不继承服务进程环境。
@@ -87,7 +88,7 @@
 - pi-ai 完整生成模型目录、价格计算、OAuth 和订阅登录。
 - Google、Bedrock、Azure 特殊认证、厂商自定义协议和路由参数。
 - WebSocket、自动网络重试、prompt cache 会话亲和与完整 cache 配置。
-- 原生 hosted tools、tool search、grammar/custom tools、语音等所有输出类型。遇到未实现的输出块会报错，不假装执行成功。
+- 除 `web_search` 外的原生 hosted tools、tool search、grammar/custom tools、语音等输出类型。遇到未实现的输出块会报错，不假装执行成功。
 - 完整跨模型历史修复、mid-conversation 原生工具变更协议；本版在请求边界折叠 system/tool 声明。
 - TypeBox 专用 symbol 语义与精确 tokenizer。
 - Redis 租约、任务接管、权限后端、MCP 工具发现与 SaaS 服务。
