@@ -19,6 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+secrets = ["cryptography>=43,<51"]
 postgres = ["psycopg[binary,pool]>=3.2,<3.3"]
 s3 = ["boto3>=1.36,<2"]
 

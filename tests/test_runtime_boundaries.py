@@ -174,7 +174,7 @@ class RuntimeBoundaryTests(unittest.IsolatedAsyncioTestCase):
         prefix = target.path.read_bytes()
         await target.commit("queues", steering=[], follow_up=[])
         self.assertTrue(target.path.read_bytes().startswith(prefix))
-        self.assertEqual(LocalSession("child", self.directory).revision, 3)
+        self.assertEqual(LocalSession("child", self.directory).revision, target.revision)
 
     async def test_provider_preparation_is_committed_by_caller_before_http(self):
         owner = asyncio.current_task()
@@ -251,11 +251,12 @@ class RuntimeBoundaryTests(unittest.IsolatedAsyncioTestCase):
         session = LocalSession(directory=None)
         await session.commit("input_queued", queue="steering", message=user_message("pending"))
         original = session.snapshot
+        revision = session.revision
         # This transition modifies queues before encountering invalid input data.
         with self.assertRaises(SessionError):
             await session.commit("run_started", queues={"steering": [user_message("new")]})
         self.assertEqual(session.snapshot, original)
-        self.assertEqual(session.revision, 1)
+        self.assertEqual(session.revision, revision)
 
     async def test_tail_poll_reads_only_new_records_and_full_reads_revalidate(self):
         writer = LocalSession("tail", self.directory)
@@ -263,14 +264,14 @@ class RuntimeBoundaryTests(unittest.IsolatedAsyncioTestCase):
             await writer.commit("input_queued", queue="steering", message=user_message(str(i)))
         reader = LocalSession("tail", self.directory)
         with patch("agent_runtime.sessions.local.json.loads", wraps=json.loads) as loads:
-            self.assertEqual(reader.read_records(after_seq=19), [])
+            self.assertEqual(reader.read_records(after_seq=20), [])
             self.assertEqual(loads.call_count, 0)
         await writer.commit("input_queued", queue="steering", message=user_message("new"))
         with patch("agent_runtime.sessions.local.json.loads", wraps=json.loads) as loads:
-            self.assertEqual([r["seq"] for r in reader.read_records(after_seq=19)], [20])
+            self.assertEqual([r["seq"] for r in reader.read_records(after_seq=20)], [21])
             self.assertEqual(loads.call_count, 1)
-        self.assertEqual(len(reader.read_records(after_seq=3)), 17)
-        self.assertEqual(len(reader.read_records()), 21)
+        self.assertEqual(len(reader.read_records(after_seq=3)), 18)
+        self.assertEqual(len(reader.read_records()), 22)
 
     async def test_tail_poll_handles_partial_tail_repair_and_replacement(self):
         writer = LocalSession("tail", self.directory)
@@ -280,17 +281,17 @@ class RuntimeBoundaryTests(unittest.IsolatedAsyncioTestCase):
         reader = LocalSession("tail", self.directory)
         with path.open("ab") as file:
             file.write(b'{"incomplete":')
-        self.assertEqual(reader.read_records(after_seq=0), [])
+        self.assertEqual(reader.read_records(after_seq=1), [])
         writer = LocalSession("tail", self.directory)
         await writer.commit("input_queued", queue="steering", message=user_message("second"))
-        self.assertEqual([r["seq"] for r in reader.read_records(after_seq=0)], [1])
+        self.assertEqual([r["seq"] for r in reader.read_records(after_seq=1)], [2])
         replacement = path.with_suffix(".replacement")
         replacement.write_bytes(original)
         replacement.replace(path)
-        self.assertEqual(reader.read_records(after_seq=1), [])
+        self.assertEqual(reader.read_records(after_seq=2), [])
         writer = LocalSession("tail", self.directory)
         await writer.commit("input_queued", queue="steering", message=user_message("replacement"))
-        records = reader.read_records(after_seq=0)
+        records = reader.read_records(after_seq=1)
         self.assertEqual(records[0]["data"]["message"]["content"][0]["text"], "replacement")
 
     async def test_tail_poll_detects_modified_same_size_record(self):
@@ -301,7 +302,7 @@ class RuntimeBoundaryTests(unittest.IsolatedAsyncioTestCase):
         session.path.write_bytes(session.path.read_bytes().replace(b'"old"', b'"bad"'))
         os.utime(session.path, ns=(stamp + 1_000_000, stamp + 1_000_000))
         with self.assertRaises(SessionError):
-            reader.read_records(after_seq=0)
+            reader.read_records(after_seq=1)
 
     async def test_split_record_is_not_skipped_by_cursor(self):
         session = LocalSession("split", self.directory)
@@ -311,10 +312,10 @@ class RuntimeBoundaryTests(unittest.IsolatedAsyncioTestCase):
         full = session.path.read_bytes()
         session.path.write_bytes(full[: before + 20])
         reader = LocalSession("split", self.directory)
-        self.assertEqual(reader.read_records(after_seq=0), [])
+        self.assertEqual(reader.read_records(after_seq=1), [])
         with session.path.open("ab") as file:
             file.write(full[before + 20 :])
-        self.assertEqual([r["seq"] for r in reader.read_records(after_seq=0)], [1])
+        self.assertEqual([r["seq"] for r in reader.read_records(after_seq=1)], [2])
 
     async def test_bounded_stream_preserves_order_and_result_only_never_stalls(self):
         stream = EventStream(lambda e: e == 100, lambda e: e, max_pending=4)

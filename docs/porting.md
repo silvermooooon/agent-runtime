@@ -67,6 +67,9 @@
 - Responses 完整原始 output 保存在 `responseOutput`，用于同 provider/model 的无状态 reasoning 重放。流式工具参数不完整时不交给执行器。
 - 未知模型允许使用已注册 provider 的默认协议；模型能力保留未知状态，不按名字猜测。
 - 四个内置工具的默认参数和主要行为参考上述固定版本；工具必须显式装配。图片后端使用 Pillow，diff 使用 difflib，因此编码结果和 diff 分块不保证逐字节等同于上游。
+- bash 环境是本 SDK 的有意差异：默认从最小变量集合开始，不继承服务进程环境。
+  可选 execution/secrets 模块复用四个工具的 operations 接口，提供按用户的目录组织、
+  按次凭据注入和输出脱敏，不是 pi 原生沙箱，也不更改 Agent loop。见 [执行边界](execution.md)。
 - 文件修改队列使用事件循环内的 asyncio.Lock，等待正在执行的 I/O 结束后释放；不是数据库锁，也不是跨进程锁。工具恢复沿用 SDK 的 replay 协议。
 - 未移植 coding-agent 的 TUI renderer、提示词元数据注入和模型专用图片配置；常用使用说明放入工具 description，图片限制可通过工厂参数显式配置。本地 bash 的进程组取消测试覆盖 macOS/POSIX；Windows 未验证，Windows 默认后端只终止直接子进程。
 - MCP 协议收发复用官方 Python `mcp` 2.2 客户端，使用 `ClientSession.send_request` 避免高层 `call_tool` 隐式发现 schema。默认按次连接，平台提供已选 schema 和身份上下文；未移植 Pi 的发现、schema 缓存、OAuth、codemode、资源读取及截断管理。

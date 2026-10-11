@@ -65,6 +65,8 @@ uv run --env-file .env python tests/live_openai.py --live
 - 工具 JSON Schema 校验、参数准备、执行前后钩子、串行／并行执行。
 - 显式装配 MCP 工具：HTTP/stdio 调用、动态请求头、已有工具审批和恢复流程。
 - 专用 `load_skill` / `load_skill_reference` 工具、可替换 SkillStore 和本地目录发现。
+- 可选用户 Memory 工具：默认本地 JSON 存储、显式 Git 存储与一次性后台整理。
+- 可选用户执行模块：独立命令环境、统一文件后端、凭据引用及加密本地凭据存储；面向可信 Demo，不是权限沙箱。
 - `finish_turn`、`prepare_request`、`prepare_next_turn`、上下文转换与动态 API key。
 - 三种 HTTP SSE 协议：OpenAI Responses、OpenAI Chat Completions、Anthropic Messages。
 - provider/model 注册、API 实现注入、参数过滤与模型限制处理。
@@ -170,6 +172,52 @@ agent = Agent(tools=create_skill_tools(store=store), system_prompt=prompt)
 ```bash
 AGENT_SKILLS_DIR=examples/skill_catalog uv run python examples/skills.py
 ```
+
+## 用户执行环境与凭据
+
+`agent_runtime.execution` 为同一 Session 装配 `read/bash/edit/write`，四个工具共用一个
+可替换后端。默认 `LocalExecutionBackend` 按租户和用户组织工作目录、HOME、输出文件，
+每次 bash 使用独立环境和临时目录，不继承服务进程中的密钥。
+
+```python
+from agent_runtime import Agent, LocalSession
+from agent_runtime.execution import create_execution_tools
+
+session = LocalSession(tenant_id="company-a", user_id="alice")
+tools = await create_execution_tools(session=session)
+agent = Agent(session=session, tools=tools)
+```
+
+可选 `agent_runtime.secrets.LocalSecretStore` 使用 Fernet 加密保存凭据，安装
+`agent-runtime[secrets]` 并配置 `AGENT_SECRETS_KEY`。模型只看到宿主允许的凭据引用和环境
+变量名，工具执行时才解析真实值；bash 输出在进入事件、日志和输出文件前进行匹配脱敏。
+保存、查询真实值和删除凭据都是宿主 API，不提供给模型。
+
+**这是可信内部 Demo 后端：不切换 Linux 用户、不限制绝对路径或网络，root 启动仍以 root
+执行。环境分离不等于权限隔离；任意 shell 也能读取注入给自己的凭据。**
+设计边界、后端替换和恢复约定见 [执行与凭据文档](docs/execution.md)。
+无需模型调用的示例：`uv run --extra secrets python examples/execution.py`。
+
+## 用户 Memory
+
+`agent_runtime.memory` 是独立选配模块，要求 Session 同时具有 `tenant_id` 和 `user_id`。
+默认实现 `LocalMemoryStore` 使用本地 JSON 文件保存文本和来源，不依赖 Git 或 Markdown 解析器。
+仅设置身份或环境变量不会启用工具、读取记忆或启动后台任务。
+
+```python
+from agent_runtime import Agent, LocalSession
+from agent_runtime.memory import create_memory_tools
+
+session = LocalSession(tenant_id="company-a", user_id="user-123")
+agent = Agent(session=session, tools=create_memory_tools(session=session))
+await agent.prompt("记住我喜欢简短的回答。")
+```
+
+提供 `memory_read/search/write/delete`，由 `AGENT_MEMORY_DIR` 配置默认存储根目录。
+宿主保证本地存储同一用户的写入串行；不新增锁或调度器。
+显式选择 `GitMemoryStore` 可获得提交版本、普通 push 冲突检测和一次提交的后台整理。
+`run_memory_dream` 由宿主按需调用，复用普通 Agent 和独立 Session。
+详细边界见 [Memory 文档](docs/memory.md)，离线示例：`uv run python examples/memory.py`。
 
 ## Session 与恢复
 
@@ -282,5 +330,10 @@ Session 保存和恢复由 Runtime 直接调用，不依赖事件订阅。`messa
 可选安装 `agent-runtime[postgres,s3]`，异步打开 `DatabaseSession` 后传给 Agent。
 完整事件存 PostgreSQL，冷日志可归档到 AWS S3 并使用指定 KMS Key 加密；
 运行、访问和模型用量事实独立保留，归档后仍可按用户和日期查询。
-[建表 DDL](src/agent_runtime/storage/sql/001_sessions.sql)、[checkpoint 迁移](src/agent_runtime/storage/sql/002_checkpoints.sql)、[配置与部署](docs/database.md)、
+[建表 DDL](src/agent_runtime/storage/sql/001_sessions.sql)、[checkpoint 迁移](src/agent_runtime/storage/sql/002_checkpoints.sql)、[会话身份迁移](src/agent_runtime/storage/sql/003_session_identity.sql)、[配置与部署](docs/database.md)、
 [无模型费用的数据库示例](examples/database_session.py)。
+
+会话归属统一通过 `session.info`（不可变的 `SessionInfo`）获取。新建 Local/DB Session 时传入
+`tenant_id` 和 `user_id`，重开时从日志恢复；LocalSession 可省略身份。Agent 无独立用户参数，
+子 Agent 和分叉默认继承归属。身份不会自动进入模型上下文，认证与授权由业务层负责。
+详见 [会话身份](docs/sessions.md#会话身份)。

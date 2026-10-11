@@ -7,11 +7,11 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 
-def resolve_path(path: str, cwd: str) -> str:
+def resolve_path(path: str, cwd: str, *, home=None) -> str:
     path = re.sub(r"[\u00a0\u2000-\u200a\u202f\u205f\u3000]", " ", path)
     path = path.removeprefix("@")
     if path == "~" or path.startswith("~/"):
-        path = os.path.expanduser(path)
+        path = os.path.join(str(home), path[2:]) if home is not None else os.path.expanduser(path)
     if path.startswith("file://"):
         url = urlsplit(path)
         if url.netloc not in ("", "localhost"):
@@ -20,8 +20,8 @@ def resolve_path(path: str, cwd: str) -> str:
     return os.path.abspath(os.path.join(cwd, path))
 
 
-def resolve_read_path(path: str, cwd: str) -> str:
-    resolved = resolve_path(path, cwd)
+def resolve_read_path(path: str, cwd: str, *, home=None) -> str:
+    resolved = resolve_path(path, cwd, home=home)
     nfd = unicodedata.normalize("NFD", resolved)
     candidates = (
         resolved,

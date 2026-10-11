@@ -27,6 +27,9 @@ postgres = [
 s3 = [
     { name = "boto3" },
 ]
+secrets = [
+    { name = "cryptography" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -37,6 +40,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", marker = "extra == 's3'", specifier = ">=1.36,<2" },
+    { name = "cryptography", marker = "extra == 'secrets'", specifier = ">=43,<51" },
     { name = "httpx", specifier = ">=0.28,<0.29" },
     { name = "httpx2", specifier = ">=2.5,<3" },
     { name = "jsonschema", specifier = ">=4.23,<5" },
@@ -45,7 +49,7 @@ requires-dist = [
     { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'postgres'", specifier = ">=3.2,<3.3" },
     { name = "pyyaml", specifier = ">=6,<7" },
 ]
-provides-extras = ["postgres", "s3"]
+provides-extras = ["secrets", "postgres", "s3"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -101,3 +101,7 @@ state = await manager.wait(task_id)
 不移植子进程 CLI、Anchor、Reporter 或持久任务图。
 
 离线示例：`uv run python examples/subagents.py`。通过模拟模型展示两个后台任务、父 Agent 继续工作和显式等待汇总，不访问真实 provider。
+
+子 Session 在首次提交前继承父 Session 的租户和用户，已指定或已持久化的身份必须一致。
+`subagent_created` 保存主任务关联，`run_started` 保存来源和 root_run_id，恢复时直接复用这些信息。
+身份不作为模型提示词。session_factory 仍接收 task_id，无需增加一套身份参数。

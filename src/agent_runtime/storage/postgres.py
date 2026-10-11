@@ -43,25 +43,25 @@ class PostgresStore:
     async def install_schema(self):
         """Explicit deployment action; not called by connect/open. Fails if already installed."""
         async with self.pool.connection() as conn:
-            for name in ("001_sessions.sql", "002_checkpoints.sql"):
+            for name in ("001_sessions.sql", "002_checkpoints.sql", "003_session_identity.sql"):
                 ddl = files("agent_runtime.storage").joinpath(f"sql/{name}").read_text()
                 await conn.execute(ddl)
 
-    async def _ensure(self, conn, tenant, sid):
+    async def _ensure(self, conn, info):
         await conn.execute(
-            "INSERT INTO agent_sessions (tenant_id,session_id) VALUES (%s,%s) "
+            "INSERT INTO agent_sessions (tenant_id,session_id,user_id) VALUES (%s,%s,%s) "
             "ON CONFLICT DO NOTHING",
-            (tenant, sid),
+            (info.tenant_id, info.session_id, info.user_id),
         )
 
     async def append(self, session, record):
         async with self.pool.connection() as conn:
-            await self._ensure(conn, session.tenant_id, session.session_id)
-            await self._insert_event(conn, session.tenant_id, session.session_id, record)
+            await self._ensure(conn, session.info)
+            await self._insert_event(conn, session.info.tenant_id, session.session_id, record)
             updated = await conn.execute(
                 "UPDATE agent_sessions SET next_seq=%s,updated_at=clock_timestamp() "
                 "WHERE tenant_id=%s AND session_id=%s AND next_seq=%s",
-                (record["seq"] + 1, session.tenant_id, session.session_id, record["seq"]),
+                (record["seq"] + 1, session.info.tenant_id, session.session_id, record["seq"]),
             )
             if updated.rowcount != 1:
                 raise SessionError("Stale session; reopen after the previous writer exits")
@@ -80,10 +80,11 @@ class PostgresStore:
                 (tenant, sid, record["seq"], record["id"]),
             )
 
-    async def import_records(self, tenant, sid, records):
+    async def import_records(self, info, records):
+        tenant, sid = info.tenant_id, info.session_id
         # Historical copies are not new access or usage and never project audit facts.
         async with self.pool.connection() as conn:
-            await self._ensure(conn, tenant, sid)
+            await self._ensure(conn, info)
             updated = await conn.execute(
                 "UPDATE agent_sessions SET next_seq=%s,updated_at=clock_timestamp() "
                 "WHERE tenant_id=%s AND session_id=%s AND next_seq=0",

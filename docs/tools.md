@@ -96,7 +96,11 @@ tools = create_coding_tools(
 
 可继承 `LocalFileOperations` / `LocalBashOperations`，也可实现相同接口，将 I/O 接到容器或远程环境。文件操作失败应抛出异常。自定义文件后端供 `edit` 和 `write` 共用同一个实例时，才能共用对应的修改队列。
 
-`bash` 还支持同步或异步 `spawn_hook(context)`，接收并返回包含 `command`、`cwd`、`env` 的字典。默认继承当前进程环境；可在此限制传给子进程的环境：
+`bash` 默认只提供 `PATH=os.defpath`、`HOME=cwd`、`LANG=C.UTF-8`，不继承服务进程环境。
+通过 `env={...}` 显式提供完整的基础环境；每次调用复制该映射，不修改 `os.environ`。
+需要 Python 虚拟环境、代理或其他程序搜索路径时，由宿主显式配置。
+也支持同步或异步 `spawn_hook(context)`，接收并返回包含 `command`、`cwd`、`env` 的字典。
+该钩子由宿主可信代码提供，不向模型开放：
 
 ```python
 tools = create_coding_tools(
@@ -126,8 +130,16 @@ agent = Agent(tools=tools, before_tool_call=approve)
 
 `read` 标记为 `replay="safe"`，允许恢复时重新读取；文件可能已经变化，因此不保证读到之前时刻的字节。`bash`、`edit`、`write` 标记为 `replay="never"`：已保存结果直接复用，若已开始却没有可靠结果，恢复时抛出 `ToolRecoveryRequired`，等待宿主核实，避免盲目重复副作用。详见 [Session 恢复](sessions.md)。
 
-恢复必须重新装配原来的工作目录、后端和钩子；这些资源不会被 Session 序列化。工具版本默认是 `pi-tools-1`，自定义后端语义改变时应显式修改 `tool.version`，让恢复校验发现变化。
+恢复必须重新装配原来的工作目录、后端和钩子；这些资源不会被 Session 序列化。
+文件工具版本为 `pi-tools-1`，bash 的独立环境语义版本为 `pi-bash-2`。
+旧版本尚未完成的 bash 调用不会静默按新语义重放。自定义后端语义改变时应修改
+`tool.version`，让恢复校验发现变化。
 
 同一事件循环内，`edit` 与 `write` 对相同规范路径串行修改，并等待正在进行的 I/O 完成后释放队列。这是进程内队列，不涉及 DB 表锁；不提供跨进程修改互斥。与 pi 一样，文件写入不是可回滚事务，进程强制退出或磁盘故障可能留下未完成文件，Session 不会自动还原文件系统。
 
 `cwd` 是相对路径的基准，不是沙箱：工具允许绝对路径、`..` 和符号链接，`bash` 具有宿主进程的执行权限。B 端租户隔离应在容器／执行后端落实。该模块不实现 Redis 接管、MCP 或权限管理服务。
+
+需要按用户装配工作目录、HOME、临时环境和凭据引用时，使用可选的
+[`create_execution_tools`](execution.md)。它复用这四个工具，统一绑定后端；默认本地实现
+只适用于可信 Demo，没有 Linux 用户切换或文件访问沙箱。文件工具的 `home` 工厂参数
+可为 `~` / `~/...` 提供执行后端自己的 HOME，不使用服务账号的 HOME。

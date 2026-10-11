@@ -58,6 +58,7 @@ class SubagentManager:
     def _child(self, task_id):
         if task_id not in self._children:
             session = self.session_factory(task_id)
+            session._inherit_identity(self.parent.session.info)
             creation = self._creation(session)
             if not creation or creation["parent_session_id"] != self.parent.session.session_id:
                 raise ValueError(f"Unknown child task: {task_id}")
@@ -83,6 +84,7 @@ class SubagentManager:
         if task_id in self._children:
             return self.get(task_id)
         session = self.session_factory(task_id)
+        session._inherit_identity(self.parent.session.info)
         if self._creation(session):
             return self.get(task_id)
         child = _Child(session)
@@ -95,6 +97,7 @@ class SubagentManager:
                 "subagent_created",
                 parent_session_id=self.parent.session.session_id,
                 operation_id=operation_id,
+                root_run_id=self.parent.session.root_run_id,
                 name=name,
                 task=task,
             )

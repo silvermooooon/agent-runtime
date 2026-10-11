@@ -7,8 +7,9 @@ Python 3.11–3.13，DDL 使用 PostgreSQL 14+ 支持的语法；CI 验证 Postg
 ## DDL 与部署
 
 版本化 DDL 随包发布在 `src/agent_runtime/storage/sql/`。
-新部署依次执行 `001_sessions.sql`、`002_checkpoints.sql`；已安装 001 的部署只执行 002。
-例如 `psql "$AGENT_DB_URL" -f .../002_checkpoints.sql`。
+新部署依次执行 `001_sessions.sql`、`002_checkpoints.sql`、`003_session_identity.sql`。
+已安装前两份 DDL 的数据库执行 003，增加会话用户归属和查询索引。
+例如 `psql "$AGENT_DB_URL" -f .../003_session_identity.sql`。
 也可以显式调用 `await store.install_schema()`。正常连接和打开 Session 不会执行 DDL。
 数据库账号需有目标 schema 的权限；schema 通过 PostgreSQL 连接串 options/search_path 配置。
 DDL 不使用 `IF NOT EXISTS` 掩盖结构不匹配，已安装时重复执行会失败。
@@ -17,7 +18,7 @@ DDL 不使用 `IF NOT EXISTS` 掩盖结构不匹配，已安装时重复执行�
 
 | 表 | 内容 | 事件冷化后 |
 |---|---|---|
-| agent_sessions | 租户、会话、创建/更新时间、next_seq、metadata | 保留 |
+| agent_sessions | 租户、用户、会话、创建/更新时间、next_seq、metadata | 保留 |
 | agent_session_events | seq、event_id、完整 record、metadata | 已归档区间删除 |
 | agent_session_archives | 序号区间、S3 URI、版本、SHA-256、格式版本、metadata | 保留 |
 | agent_session_checkpoints | checkpoint 的 seq、event_id；不保存状态正文 | 保留 |
@@ -35,7 +36,6 @@ DDL 不使用 `IF NOT EXISTS` 掩盖结构不匹配，已安装时重复执行�
 from agent_runtime import Agent
 from agent_runtime.sessions import DatabaseSession
 from agent_runtime.storage import ArchiveConfig, DatabaseConfig
-from agent_runtime.storage.audit import AuditContext
 from agent_runtime.storage.postgres import PostgresStore
 from agent_runtime.storage.s3 import S3Archive
 
@@ -43,10 +43,15 @@ archive_config = ArchiveConfig.from_env()
 archive = S3Archive(archive_config) if archive_config.enabled else None
 store = await PostgresStore.connect(DatabaseConfig.from_env(), archive=archive)
 try:
-    session = await DatabaseSession.open(
-        store, tenant_id="company-a", session_id="conversation-123",
-        audit_context=AuditContext(user_id="user-456"),
-    )
+    try:
+        session = await DatabaseSession.open(
+            store, tenant_id="company-a", session_id="conversation-123"
+        )
+    except FileNotFoundError:
+        session = DatabaseSession(
+            store, tenant_id="company-a", user_id="user-456", session_id="conversation-123"
+        )
+    print(session.info.user_id)  # 新建时指定，重开时从日志恢复。
     agent = Agent(session=session, model="gpt-6-luna")
     if session.resumable:
         await agent.resume()
@@ -61,6 +66,12 @@ finally:
 一个服务进程共享一个连接池，不为每个 Session 创建连接池。
 
 `DatabaseSession(...)` 构造器仅用于全新会话，不执行网络 I/O；已有会话必须 `await open()`。
+新建会话在首次有效写入前追加 `session_created`，数据库写入要求 tenant_id 和 user_id 均非空。
+用户身份的唯一入口是 Session：`session.info` 返回不可变的 SessionInfo，不单独向审查组件传用户信息。
+`open(store, tenant_id=..., session_id=...)` 只定位已有会话，不接受 user_id，也不创建缺失会话。
+会话归属由日志恢复；业务入口仍要验证当前访问者的权限。agent_sessions.user_id 是查询投影，冷化后保留。
+本版采用包含身份的日志和 checkpoint v2，不自动迁移此前无身份的测试会话；旧测试会话请使用新的 ID 重建。
+DDL 003 保留旧行及历史审查数据，不推断或覆盖旧用户归属。
 同步 `build_context()`、`snapshot` 读取当前执行状态。历史记录使用 `await session.aread_records(after_seq)`，
 历史状态使用 `await session.asnapshot_at(event_id)`；DB Session 的同步历史接口会提示使用异步接口。
 观察其他 Worker 的新事件也可调用 `await session.read_latest_records(after_seq)`，不会修改当前执行状态。
@@ -68,7 +79,7 @@ finally:
 
 打开时查找最近的压缩 checkpoint，只读取该事件到日志末尾，推算后释放事件列表。
 内存保留上下文、运行阶段、队列、运行输出和子 Agent 关联等恢复状态，不保留完整日志缓存。
-没有 checkpoint 的旧会话从头重放；主动或自动压缩成功后自动生成 checkpoint，无额外配置。
+尚未产生 checkpoint 的会话从头重放；主动或自动压缩成功后自动生成 checkpoint，无额外配置。
 状态正文放在压缩事件的 `checkpoint` 字段中，定位表和事件在同一事务提交。
 定位表在冷化后保留，恢复只下载与所需区间相交的 S3 对象；gzip 对象内部仍需整块解压。
 
@@ -82,7 +93,7 @@ checkpoint 不删除旧数据，也不执行模型或工具。工具、回调和
 
 `run_started` / `run_resumed` / 终态事件投影到 agent_runs，和事件本身在同一事务提交。
 恢复同一运行不新增用户运行次数；分叉导入历史不产生新的历史访问或用量。
-默认 root_run_id 使用 `session_id/run_id`，避免独立分叉保留旧 run_id 时错误合并主任务统计。
+运行来源 source、root_run_id 随 run_started 保存，恢复复用；root_run_id 使用 `session_id/run_id`，避免独立分叉保留旧 run_id 时错误合并主任务统计。
 分叉后恢复执行才记录新运行事实与新模型调用。
 
 DB Session 通过 Agent 的 stream 包装接口记录模型调用尝试：
@@ -163,7 +174,9 @@ await store.archive_session("company-a", "conversation-123")
 子 Agent 的 Session 工厂保持同步：新任务可返回新的 DatabaseSession；已有任务需要业务先异步 open，
 放进以 task_id 为键的实例字典，工厂只返回已打开对象。任务 ID 可从父日志的 spawn_agent 结果中取得；
 父工具尚未保存结果时，使用同一父工具操作标识调用 manager.task_id() 计算，再异步 open。
-未存在的会话 open 返回空 Session，不写 DB。每个子 Session 只允许一个活动执行者。
+不存在的会话 open 抛出 FileNotFoundError，新建时使用构造器。每个子 Session 只允许一个活动执行者。
+Manager 在子 Session 第一次提交前绑定父会话的租户和用户；工厂可留空 user_id，已指定身份必须匹配。
+子 Agent 的运行来源为 subagent，主任务关联随 subagent_created 保存，不再通过查询父审查记录推断用户。
 
 源会话可以 `await session.fork(event_id)`，也可通过现有 fork_into 导入 LocalSession。
 DB 分叉在一个事务中发布完整历史，不把原用量再次计费。对冷历史跳转需要读取对应日志，当前不保留逐冷事件索引。

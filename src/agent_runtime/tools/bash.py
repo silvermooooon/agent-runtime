@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Protocol
 
+from ..sessions import SessionError
 from ..types import AbortSignal, AgentTool, AgentToolResult, maybe_await
 from ._output import OutputAccumulator
 from ._truncate import DEFAULT_MAX_BYTES, format_size
@@ -69,8 +70,9 @@ class _ProcessProtocol(asyncio.SubprocessProtocol):
 
 
 class LocalBashOperations:
-    def __init__(self, shell_path=None):
+    def __init__(self, shell_path=None, *, cleanup_background=False):
         self.shell_path = shell_path
+        self.cleanup_background = cleanup_background
 
     async def exec(self, command, cwd, *, on_data, signal, timeout, env):
         signal.throw_if_aborted()
@@ -126,7 +128,7 @@ class LocalBashOperations:
                 if task:
                     task.cancel()
             if transport:
-                if not completed:
+                if not completed or self.cleanup_background:
                     try:
                         if os.name == "posix":
                             os.killpg(transport.get_pid(), process_signal.SIGKILL)
@@ -153,9 +155,13 @@ def create_bash_tool(
     shell_path: str | None = None,
     spawn_hook=None,
     output_dir: str | Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> AgentTool:
     cwd = str(Path(cwd).expanduser().absolute())
     ops = operations if operations is not None else LocalBashOperations(shell_path)
+    base_env = (
+        dict(env) if env is not None else {"PATH": os.defpath, "HOME": cwd, "LANG": "C.UTF-8"}
+    )
 
     async def execute(call_id, args, signal=None, on_update=None):
         signal = signal or AbortSignal()
@@ -174,16 +180,8 @@ def create_bash_tool(
         context = {
             "command": f"{command_prefix}\n{command}" if command_prefix else command,
             "cwd": cwd,
-            "env": dict(os.environ),
+            "env": dict(base_env),
         }
-        for name in (
-            "PI_SESSION_ID",
-            "PI_SESSION_FILE",
-            "PI_PROVIDER",
-            "PI_MODEL",
-            "PI_REASONING_LEVEL",
-        ):
-            context["env"].pop(name, None)
         if spawn_hook:
             context = await maybe_await(spawn_hook(context))
         signal.throw_if_aborted()
@@ -243,6 +241,8 @@ def create_bash_tool(
                     timeout=timeout,
                     env=context["env"],
                 )
+            except SessionError:
+                raise
             except Exception as caught:
                 error = caught
                 code = None
@@ -328,5 +328,5 @@ def create_bash_tool(
         execute,
         label="bash",
         replay="never",
-        version="pi-tools-1",
+        version="pi-bash-2",
     )

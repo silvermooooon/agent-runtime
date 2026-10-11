@@ -36,13 +36,15 @@ def prepare_edit_arguments(args):
     return args
 
 
-def create_edit_tool(cwd: str | Path, *, operations: EditOperations | None = None) -> AgentTool:
+def create_edit_tool(
+    cwd: str | Path, *, operations: EditOperations | None = None, home: str | Path | None = None
+) -> AgentTool:
     cwd = str(Path(cwd).expanduser().absolute())
     ops = operations if operations is not None else LocalFileOperations()
 
     async def execute(call_id, args, signal=None, on_update=None):
         signal = signal or AbortSignal()
-        path = resolve_path(args["path"], cwd)
+        path = resolve_path(args["path"], cwd, home=home)
         async with file_mutation(path, operations):
             signal.throw_if_aborted()
             await settle(ops.access(path))

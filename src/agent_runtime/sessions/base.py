@@ -6,7 +6,7 @@ import asyncio
 import json
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, replace
 from uuid import uuid4
 
 from ..transcript import tool_declaration
@@ -16,6 +16,22 @@ from .projection import append_messages, apply_compaction, replace_messages
 
 class SessionError(RuntimeError):
     """Persistence, format or recovery contract failure; never a tool result."""
+
+
+@dataclass(frozen=True)
+class SessionInfo:
+    """Stable conversation ownership, supplied by the host; not authentication."""
+
+    session_id: str
+    tenant_id: str | None = None
+    user_id: str | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.session_id, str) or not self.session_id:
+            raise ValueError("session_id must be a non-empty string")
+        for value in (self.tenant_id, self.user_id):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError("Identity fields must be non-empty strings or None")
 
 
 class ToolRecoveryRequired(SessionError):
@@ -76,6 +92,7 @@ def tool_records(tools):
 
 def empty_state():
     return {
+        "info": None,
         "messages": [],
         "message_ids": [],
         "compaction": None,
@@ -87,6 +104,8 @@ def empty_state():
         "status": "idle",
         "phase": "idle",
         "run_id": None,
+        "run_source": None,
+        "root_run_id": None,
         "model": None,
         "options": {},
         "tools": [],
@@ -138,13 +157,17 @@ def reduce_record(state, record):
     if kind == "compaction" and "checkpoint" in record:
         checkpoint = record["checkpoint"]
         if (
-            checkpoint["version"] != 1
+            checkpoint["version"] != 2
             or not isinstance(checkpoint["state"], dict)
             or checkpoint["state"].keys() != empty_state().keys()
         ):
             raise ValueError("Unsupported checkpoint state")
         state.clear()
         state.update(deepcopy(checkpoint["state"]))
+    elif kind == "session_created":
+        if record["seq"] != 0:
+            raise ValueError("Session identity can only be created once")
+        state["info"] = asdict(SessionInfo(**data["info"]))
     elif kind == "subagent_created":
         if state["subagent_creation"] is None:
             state["subagent_creation"] = deepcopy(data)
@@ -166,6 +189,8 @@ def reduce_record(state, record):
             status="running",
             phase="model",
             run_id=data["run_id"],
+            run_source=data["source"],
+            root_run_id=data["root_run_id"],
             model=data["model"],
             options=data["options"],
             tools=data["tools"],
@@ -268,7 +293,7 @@ def reduce_record(state, record):
         state.update(status="running", error=None)
     elif kind == "history_reset":
         composition = {
-            key: state[key] for key in ("subagent_creation", "has_runs", "spawn_operations")
+            key: state[key] for key in ("info", "subagent_creation", "has_runs", "spawn_operations")
         }
         state.clear()
         state.update(empty_state())
@@ -285,7 +310,13 @@ def reduce_record(state, record):
         replace_messages(state, data["messages"], record, "messages")
         state["compaction"] = None
     elif kind == "session_forked":
-        state["origin"] = deepcopy(data)
+        state["origin"] = {k: deepcopy(v) for k, v in data.items() if k != "info"}
+        state["info"] = asdict(SessionInfo(**data["info"]))
+        # Future work belongs to the independent branch, not the parent's run tree.
+        state["run_source"] = "user" if state["info"]["user_id"] else "system"
+        state["root_run_id"] = (
+            f"{state['info']['session_id']}/{state['run_id']}" if state["run_id"] else None
+        )
     else:
         raise SessionError(f"Unknown required session record: {kind}")
 
@@ -295,12 +326,60 @@ class Session(ABC):
 
     durable = False
 
-    def __init__(self, session_id=None):
-        self.session_id = uuid4().hex if session_id is None else session_id
+    def __init__(self, session_id=None, *, tenant_id=None, user_id=None):
         self._state = empty_state()
+        self._state["info"] = asdict(
+            SessionInfo(session_id if session_id is not None else uuid4().hex, tenant_id, user_id)
+        )
         self._seq = 0
         self._failed = False
         self.live = {}  # Bounded latest-value snapshots, never a token event queue.
+
+    @property
+    def info(self):
+        return SessionInfo(**self._state["info"])
+
+    @property
+    def session_id(self):
+        return self._state["info"]["session_id"]
+
+    @property
+    def run_source(self):
+        return self._state["run_source"]
+
+    @property
+    def root_run_id(self):
+        return self._state["root_run_id"]
+
+    def _restore(self, records):
+        if not records:
+            return
+        expected = self.info
+        state = replay_records(records)
+        if state["info"] is None:
+            raise SessionError(
+                "Journal has no session identity; recreate this pre-identity session"
+            )
+        actual = SessionInfo(**state["info"])
+        if actual.session_id != expected.session_id or any(
+            getattr(expected, key) is not None and getattr(expected, key) != getattr(actual, key)
+            for key in ("tenant_id", "user_id")
+        ):
+            raise SessionError("Stored session identity does not match the requested identity")
+        self._state, self._seq = state, records[-1]["seq"] + 1
+
+    def _inherit_identity(self, parent):
+        """Bind a new child's ownership; a persisted identity can never be rebound."""
+        expected = replace(parent, session_id=self.session_id)
+        if self.info == expected:
+            return
+        if self.revision or any(
+            getattr(self.info, key) is not None
+            and getattr(self.info, key) != getattr(expected, key)
+            for key in ("tenant_id", "user_id")
+        ):
+            raise SessionError("Child session ownership must match its parent")
+        self._state["info"] = asdict(expected)
 
     def wrap_stream_fn(self, stream_fn):
         """Optional storage auditing around physical model calls."""
@@ -369,6 +448,9 @@ class Session(ABC):
         """Copy a complete prefix into an empty independent Session, preserving checkpoints."""
         if target is self or target.session_id == self.session_id:
             raise SessionError("Fork needs a different session ID")
+        if target.revision:
+            raise SessionError("Fork target must be empty")
+        target._inherit_identity(self.info)
         records = self._select_prefix(await self.aread_records(), event_id)
         records.append(
             {
@@ -377,13 +459,15 @@ class Session(ABC):
                 "type": "session_forked",
                 "time": timestamp(),
                 "run_id": records[-1].get("run_id"),
-                "data": {"parent_session_id": self.session_id, "parent_event_id": event_id},
+                "data": {
+                    "parent_session_id": self.session_id,
+                    "parent_event_id": event_id,
+                    "info": asdict(target.info),
+                },
             }
         )
         state = replay_records(records)
         try:
-            if target.revision:
-                raise SessionError("Fork target must be empty")
             task = asyncio.create_task(target._import_records(records))
             cancelled = False
             while not task.done():
@@ -406,6 +490,8 @@ class Session(ABC):
         if self._failed:
             raise SessionError("Session persistence failed; reopen the session before continuing")
         try:
+            if kind == "session_created" and data.get("info") != asdict(self.info):
+                raise ValueError("Session identity is fixed at creation")
             record = json.loads(
                 json.dumps(
                     {
@@ -429,9 +515,12 @@ class Session(ABC):
             reduce_record(candidate, record)
             if kind == "compaction":
                 # A single durable event publishes both the summary and its recovery state.
-                record["checkpoint"] = {"version": 1, "state": deepcopy(candidate)}
+                record["checkpoint"] = {"version": 2, "state": deepcopy(candidate)}
         except (TypeError, ValueError, KeyError) as error:
             raise SessionError(f"Invalid session record {kind}: {error}") from error
+        if self._seq == 0 and kind != "session_created":
+            await self.commit("session_created", info=asdict(self.info))
+            record["seq"] = self._seq
         task = asyncio.create_task(self._persist(self._seq, record))
         cancelled = False
         try:
@@ -471,8 +560,12 @@ class Session(ABC):
     async def begin(self, context, inputs, config):
         if self.resumable:
             raise SessionError("Session has unfinished work; call Agent.resume() first")
+        run_id = uuid4().hex
+        creation = self.subagent_creation if not self._state["origin"] else None
         data = dict(
-            run_id=uuid4().hex,
+            run_id=run_id,
+            source="subagent" if creation else "user" if self.info.user_id else "system",
+            root_run_id=(creation or {}).get("root_run_id") or f"{self.session_id}/{run_id}",
             inputs=inputs,
             model=model_record(config.model),
             options=saved_options(config.options),

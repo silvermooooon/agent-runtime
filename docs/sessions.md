@@ -21,6 +21,28 @@ await agent.prompt("处理这个任务")
 如果只需要内存运行，可以使用同一个组件的 `LocalSession(directory=None)`。
 此模式没有文件，`session.durable` 为 False，进程退出后不能恢复。
 
+## 会话身份
+
+```python
+session = LocalSession(
+    "conversation-123", "./sessions", tenant_id="company-a", user_id="user-456"
+)
+agent = Agent(session=session)
+print(agent.session.info)  # SessionInfo(session_id, tenant_id, user_id)，不可变
+
+restored = LocalSession("conversation-123", "./sessions")
+assert restored.info.user_id == "user-456"
+```
+
+SessionInfo 定义在 Session 层，Local/DB 使用相同语义。归属创建后不变；重开时若同时传入身份，必须与记录相符。
+身份首次随 session_created 持久化，压缩 checkpoint 也保存它。尚未发生任何写入时，构造器不创建文件。
+身份不自动加入模型上下文、每条消息或工具参数。纯本地使用可省略 tenant_id/user_id；SDK 不生成虚假的用户 ID。
+子 Agent 自动继承归属，分叉使用新 session_id 并继承归属；显式绑定了其他归属的目标会话会被拒绝。
+history_reset 只清理对话状态，保留会话身份。访问者认证、鉴权和共享关系由业务层管理。
+运行来源、主任务关联保存在运行记录，访问审查仍单独记录实际访问者，不能将访问者等同于会话所有者。
+
+当前日志要求 session_created，checkpoint 使用版本 2。不自动迁移此前无身份的测试日志；使用新会话 ID 开始。
+
 ## 保存内容
 
 内存中的 `session.live` 只保留最新的模型输出和各个运行中工具的进度，不累积 token 事件列表。
@@ -40,7 +62,8 @@ sessions/
 
 | 记录 | 内容与作用 |
 | --- | --- |
-| run_started | 本轮输入、模型元数据、参数、工具定义和版本、调度方式、所需钩子名称 |
+| session_created | 会话 ID、租户和用户归属；首次有效提交前写入一次 |
+| run_started | 运行来源、主任务关联、本轮输入、模型元数据、参数、工具定义和版本、调度方式、所需钩子名称 |
 | messages_added / queues | 注入上下文、安全边界处的排队输入及消费进度 |
 | model_request | 当前模型配置；上下文或转换后的输入发生变化时记录相应内容 |
 | provider_parameters | SDK 内置 HTTP adapter 最终过滤／重写后的参数及处理报告 |
@@ -55,7 +78,7 @@ sessions/
 | compaction_started / compaction_failed | 摘要生成尝试、范围、配置和失败原因 |
 | compaction | 完整摘要、保留边界、生成详情，以及带版本的独立恢复 checkpoint |
 | context_replaced | 自定义请求准备改变上下文时，记录新的选择结果 |
-| session_forked | 新会话来源的 session ID 和 event ID；之前已复制完整前缀 |
+| session_forked | 新会话身份及来源 session ID / event ID；之前已复制完整前缀 |
 
 常规执行不在每个边界重复存储整份历史；完整历史由记录推导。
 自定义上下文替换或转换改变实际模型输入时，需要保留相应快照。

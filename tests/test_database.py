@@ -19,7 +19,6 @@ HAS_DB = importlib.util.find_spec("psycopg") is not None
 if HAS_DB:
     from psycopg import AsyncConnection, sql
 
-    from agent_runtime.storage.audit import AuditContext
     from agent_runtime.storage.postgres import PostgresStore
 
 
@@ -92,7 +91,6 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.s3 = FakeS3()
         self.store = PostgresStore(pool, archive=S3Archive(ArchiveTests().config(), client=self.s3))
         await self.store.install_schema()
-        self.ctx = AuditContext("alice")
         self.session = await self.open("main")
 
     async def cleanup_database(self):
@@ -104,9 +102,10 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.admin.close()
 
     async def open(self, sid, *, tenant="org"):
-        return await DatabaseSession.open(
-            self.store, tenant_id=tenant, audit_context=self.ctx, session_id=sid
-        )
+        try:
+            return await DatabaseSession.open(self.store, tenant_id=tenant, session_id=sid)
+        except FileNotFoundError:
+            return DatabaseSession(self.store, tenant_id=tenant, user_id="alice", session_id=sid)
 
     async def rows(self, table):
         async with self.store.pool.connection() as conn:
@@ -126,6 +125,32 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         agent = Agent(model=MODEL, session=session or self.session, stream_fn=self.provider())
         await agent.prompt("hello\x00world")
         return agent
+
+    async def test_identity_restored_without_user_input_after_cold_checkpoint(self):
+        agent = await self.run_agent()
+        await agent.compact(summary="identity remains stable")
+        await self.store.archive_session("org", "main")
+        restored = await DatabaseSession.open(self.store, tenant_id="org", session_id="main")
+        self.assertEqual(restored.info.user_id, "alice")
+        self.assertEqual(restored.info, self.session.info)
+        rows = await self.rows("agent_sessions")
+        self.assertEqual(rows[0]["user_id"], "alice")
+        branch = await restored.fork((await restored.aread_records())[-1]["id"], session_id="owned")
+        self.assertEqual(branch.info.user_id, "alice")
+        self.assertEqual(branch.info.session_id, "owned")
+        self.assertEqual((await self.open("owned")).info, branch.info)
+        with self.assertRaises(FileNotFoundError):
+            await DatabaseSession.open(self.store, tenant_id="other", session_id="main")
+        with self.assertRaises(TypeError):
+            await DatabaseSession.open(
+                self.store, tenant_id="org", session_id="main", user_id="bob"
+            )
+
+    async def test_missing_user_rejected_before_database_writes(self):
+        session = DatabaseSession(self.store, tenant_id="org", session_id="unowned")
+        with self.assertRaisesRegex(SessionError, "user_id"):
+            await session.commit("queues", steering=[], follow_up=[])
+        self.assertEqual(await self.rows("agent_sessions"), [])
 
     async def test_roundtrip_usage_and_tenant_isolation(self):
         await self.run_agent()
@@ -255,12 +280,14 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(await self.store.audit_history("org", "alice", start, end)), 1)
 
     async def test_projection_failure_rolls_back_event_and_revision(self):
-        original = self.ctx
-        # Constraint failure in the retained fact must also roll back the source event.
-        object.__setattr__(original, "source", "invalid")
+        # Failure in a retained fact must roll back run_started, leaving only creation.
+        async with self.store.pool.connection() as conn:
+            await conn.execute("ALTER TABLE agent_runs ADD CHECK (source = 'invalid')")
         with self.assertRaises(SessionError):
             await self.run_agent()
-        self.assertEqual(await self.rows("agent_session_events"), [])
+        events = await self.rows("agent_session_events")
+        self.assertEqual([r["record"]["type"] for r in events], ["session_created"])
+        self.assertEqual((await self.rows("agent_sessions"))[0]["next_seq"], 1)
         self.assertEqual(await self.rows("agent_runs"), [])
 
     async def test_upload_failure_keeps_hot_events(self):
@@ -342,7 +369,6 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 children[key] = DatabaseSession(
                     self.store,
                     tenant_id="org",
-                    audit_context=AuditContext("worker-service", source="system"),
                     session_id=key,
                 )
             return children[key]

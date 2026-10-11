@@ -18,6 +18,7 @@ def create_read_tool(
     operations: ReadOperations | None = None,
     auto_resize_images: bool = True,
     resize_options: ImageResizeOptions | None = None,
+    home: str | Path | None = None,
 ) -> AgentTool:
     cwd = str(Path(cwd).expanduser().absolute())
     ops = operations if operations is not None else LocalFileOperations()
@@ -25,7 +26,9 @@ def create_read_tool(
     async def execute(call_id, args, signal=None, on_update=None):
         signal = signal or AbortSignal()
         signal.throw_if_aborted()
-        path = (resolve_read_path if operations is None else resolve_path)(args["path"], cwd)
+        path = (resolve_read_path if operations is None else resolve_path)(
+            args["path"], cwd, home=home
+        )
         await ops.access(path)
         signal.throw_if_aborted()
         data = await ops.read_file(path)

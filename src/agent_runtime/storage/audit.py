@@ -1,6 +1,5 @@
 """Small retained facts, projected in the same transaction as the source event."""
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from psycopg.types.json import Jsonb
@@ -10,38 +9,15 @@ def instant(milliseconds):
     return datetime.fromtimestamp(milliseconds / 1000, timezone.utc)
 
 
-@dataclass(frozen=True)
-class AuditContext:
-    user_id: str
-    source: str = "user"
-    root_run_id: str | None = None
-
-    def __post_init__(self):
-        if not self.user_id or self.source not in ("user", "subagent", "system"):
-            raise ValueError("AuditContext requires user_id and a valid source")
-
-
 async def project(conn, session, record):
-    tenant, sid = session.tenant_id, session.session_id
+    tenant, sid = session.info.tenant_id, session.session_id
     kind, data, run = record["type"], record["data"], record["run_id"]
-    context = session.audit_context
+    user_id = session.info.user_id
     at = instant(record["time"])
     if kind in ("run_started", "run_resumed"):
-        creation = session.subagent_creation
-        if creation and not session.snapshot["origin"]:
-            prefix = creation["parent_session_id"] + "/"
-            parent_run = creation["operation_id"].partition(prefix)[2].partition("/")[0]
-            parent = await (
-                await conn.execute(
-                    "SELECT user_id,root_run_id FROM agent_runs "
-                    "WHERE tenant_id=%s AND session_id=%s AND run_id=%s",
-                    (tenant, creation["parent_session_id"], parent_run),
-                )
-            ).fetchone()
-            if parent:
-                context = AuditContext(parent["user_id"], "subagent", parent["root_run_id"])
-            else:
-                context = AuditContext(context.user_id, "subagent", context.root_run_id)
+        source = data["source"] if kind == "run_started" else session.run_source
+        root_run_id = data["root_run_id"] if kind == "run_started" else session.root_run_id
+
         await conn.execute(
             """INSERT INTO agent_runs
             (tenant_id,session_id,run_id,user_id,root_run_id,source,started_at,status)
@@ -52,9 +28,9 @@ async def project(conn, session, record):
                 tenant,
                 sid,
                 run,
-                context.user_id,
-                context.root_run_id or f"{sid}/{run}",
-                context.source,
+                user_id,
+                root_run_id,
+                source,
                 at,
             ),
         )
@@ -65,13 +41,6 @@ async def project(conn, session, record):
             ("completed" if kind == "run_completed" else data["status"], at, tenant, sid, run),
         )
     elif kind == "model_call_started":
-        row = await (
-            await conn.execute(
-                "SELECT user_id,root_run_id FROM agent_runs "
-                "WHERE tenant_id=%s AND session_id=%s AND run_id=%s",
-                (tenant, sid, run),
-            )
-        ).fetchone()
         await conn.execute(
             """INSERT INTO agent_model_usage
             (tenant_id,attempt_id,session_id,run_id,root_run_id,user_id,provider,model,
@@ -82,8 +51,8 @@ async def project(conn, session, record):
                 data["attempt_id"],
                 sid,
                 run,
-                row["root_run_id"] if row else context.root_run_id,
-                row["user_id"] if row else context.user_id,
+                session.root_run_id,
+                user_id,
                 data["provider"],
                 data["model"],
                 data["purpose"],

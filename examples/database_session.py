@@ -11,7 +11,6 @@ from uuid import uuid4
 from agent_runtime import Agent, AssistantMessageEventStream, Model, assistant_message
 from agent_runtime.sessions import DatabaseSession
 from agent_runtime.storage import ArchiveConfig, DatabaseConfig
-from agent_runtime.storage.audit import AuditContext
 from agent_runtime.storage.postgres import PostgresStore
 from agent_runtime.storage.s3 import S3Archive
 
@@ -37,12 +36,14 @@ async def main():
         DatabaseConfig.from_env(), archive=S3Archive(config) if config.enabled else None
     )
     try:
-        session = await DatabaseSession.open(
-            store,
-            tenant_id="example",
-            session_id="database-example",
-            audit_context=AuditContext("example-user"),
-        )
+        try:
+            session = await DatabaseSession.open(
+                store, tenant_id="example", session_id="database-example"
+            )
+        except FileNotFoundError:
+            session = DatabaseSession(
+                store, tenant_id="example", user_id="example-user", session_id="database-example"
+            )
         await store.audit(
             tenant_id="example",
             audit_id=uuid4().hex,

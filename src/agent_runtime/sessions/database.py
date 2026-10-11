@@ -8,21 +8,21 @@ from .base import Session, SessionError, replay_records, saved_options
 class DatabaseSession(Session):
     durable = True
 
-    def __init__(self, store, *, tenant_id, audit_context, session_id=None):
+    def __init__(self, store, *, tenant_id, user_id=None, session_id=None):
         """Construct a NEW session. Existing sessions must use await open()."""
-        super().__init__(session_id)
+        super().__init__(session_id, tenant_id=tenant_id, user_id=user_id)
         if not tenant_id:
             raise ValueError("tenant_id is required")
         self.store = store
-        self.tenant_id = tenant_id
-        self.audit_context = audit_context
 
     @classmethod
-    async def open(cls, store, **kwargs):
-        session = cls(store, **kwargs)
-        records = await store.read_recovery_records(session.tenant_id, session.session_id)
-        session._state = replay_records(records)
-        session._seq = records[-1]["seq"] + 1 if records else 0
+    async def open(cls, store, *, tenant_id, session_id):
+        session = cls(store, tenant_id=tenant_id, session_id=session_id)
+        records = await store.read_recovery_records(session.info.tenant_id, session.session_id)
+        if not records:
+            raise FileNotFoundError(f"Unknown session: {session_id}")
+        session._restore(records)
+        session._require_identity()
         return session
 
     def read_records(self, after_seq=-1):
@@ -33,29 +33,37 @@ class DatabaseSession(Session):
 
     async def aread_records(self, after_seq=-1):
         """Read storage on demand without retaining history or changing execution state."""
-        return await self.store.read_records(self.tenant_id, self.session_id, after_seq)
+        return await self.store.read_records(self.info.tenant_id, self.session_id, after_seq)
 
     async def read_latest_records(self, after_seq=-1):
         return await self.aread_records(after_seq)
 
     async def asnapshot_at(self, event_id):
         records = await self.store.read_recovery_records(
-            self.tenant_id, self.session_id, event_id=event_id
+            self.info.tenant_id, self.session_id, event_id=event_id
         )
         return replay_records(records)
 
+    def _require_identity(self):
+        if not self.info.tenant_id or not self.info.user_id:
+            raise ValueError(
+                "DatabaseSession requires tenant_id and user_id before its first write"
+            )
+
     async def _persist(self, seq, record):
+        self._require_identity()
         await self.store.append(self, record)
 
     async def _import_records(self, records):
-        await self.store.import_records(self.tenant_id, self.session_id, records)
+        self._require_identity()
+        await self.store.import_records(self.info, records)
 
-    async def fork(self, event_id, *, session_id=None, audit_context=None):
+    async def fork(self, event_id, *, session_id=None):
         target = DatabaseSession(
             self.store,
-            tenant_id=self.tenant_id,
+            tenant_id=self.info.tenant_id,
             session_id=session_id,
-            audit_context=audit_context or self.audit_context,
+            user_id=self.info.user_id,
         )
         return await self.fork_into(event_id, target)
 

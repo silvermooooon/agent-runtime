@@ -12,7 +12,7 @@ from copy import deepcopy
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-from .base import Session, SessionError, replay_records
+from .base import Session, SessionError
 
 
 def encode(value):
@@ -28,8 +28,10 @@ class LocalSession(Session):
     Journal reads do not change the file; the next append repairs an incomplete tail.
     """
 
-    def __init__(self, session_id=None, directory=".agent-runtime/sessions"):
-        super().__init__(session_id)
+    def __init__(
+        self, session_id=None, directory=".agent-runtime/sessions", *, tenant_id=None, user_id=None
+    ):
+        super().__init__(session_id, tenant_id=tenant_id, user_id=user_id)
         if not isinstance(self.session_id, str) or not re.fullmatch(
             r"[A-Za-z0-9_-]{1,128}", self.session_id
         ):
@@ -145,9 +147,8 @@ class LocalSession(Session):
             # A missing/stale index never replaces the authoritative journal.
             self._checkpoint_position = None
             records, size, boundary = self._read_file()
-        state = replay_records(records)
+        self._restore(records)
         self._tail_boundary = boundary if boundary != size else None
-        self._state, self._seq = state, records[-1]["seq"] + 1 if records else 0
         self._write_checkpoint_index()
         self._records = []
 

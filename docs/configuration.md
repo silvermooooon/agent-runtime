@@ -24,6 +24,10 @@
 | `AGENT_TEMPERATURE` | 不发送 | 温度参数，仍经过兼容过滤 |
 | `AGENT_REASONING` | provider 默认值 | 统一 reasoning 等级 |
 | `AGENT_SKILLS_DIR` | 无 | 显式装配 LocalSkillStore/Skill 工具时使用的本地目录；模板示例为 ./skills |
+| `AGENT_MEMORY_DIR` | .agent-runtime/memory | 显式装配 LocalMemoryStore/Memory 工具时的存储根目录，内部按租户和用户分目录 |
+| `AGENT_WORKSPACE_DIR` | .agent-runtime/workspaces | 显式装配 LocalExecutionBackend 时的用户工作目录根路径 |
+| `AGENT_SECRETS_DIR` | .agent-runtime/secrets | LocalSecretStore 的加密文件目录，应位于用户工作空间之外 |
+| `AGENT_SECRETS_KEY` | 无 | LocalSecretStore 所需的 Fernet 主密钥，由宿主独立提供，不传入命令环境 |
 
 未知模型的 4096 是 SDK 的初始输出预算，不是推测的模型能力；需要更大预算时注册准确的 `Model.max_tokens`。空字符串按未设置处理。配置数值或 URL 格式错误时直接报错，不静默使用意外地址。
 
@@ -66,3 +70,19 @@ Session 不读取新的环境变量，存储路径由宿主显式配置；`direc
 ## Skill 存储位置
 
 `LocalSkillStore()`、`create_skill_tools()` 从 `AGENT_SKILLS_DIR` 获取本地目录。显式 `directory` 优先；传入自定义 `store` 时不读取本地存储配置。`Agent()` 不会因设置了这个环境变量就自动启用工具。目录布局、专用加载工具和后端替换见 [Skill 加载](skills.md)。
+
+## Memory 存储位置
+
+`LocalMemoryStore(session.info)` 和 `create_memory_tools(session=session)` 默认读取
+`AGENT_MEMORY_DIR`。显式 `directory` 优先，也可以传入 `env=mapping`；`env={}` 不继承进程环境。
+传入自定义 `store` 后不再读取此项。Git 后端的 remote、branch 由宿主按用户显式传入，
+不提供所有用户共享的默认仓库地址。完整装配方式见 [Memory](memory.md)。
+
+## 执行环境与凭据
+
+`LocalExecutionBackend` 的 `directory`、`LocalSecretStore` 的 `directory/key` 优先于对应环境变量，
+二者都支持 `env=mapping` 指定配置来源。配置来源不会作为子进程环境传递。
+`LocalExecutionBackend(base_env={...})` 才是宿主显式选择的非敏感子进程基础变量；
+不自动继承 PATH、代理、API Key、数据库连接串或主密钥。
+按次解析的凭据由 `credential_refs` 选择，不在全局环境里注册。
+详见 [执行环境与凭据管理](execution.md)。
