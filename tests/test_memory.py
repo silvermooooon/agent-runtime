@@ -78,6 +78,21 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await self.store.read(key)
 
+    async def test_list_entries_pages_only_selected_bodies(self):
+        for key in ("a", "b", "c", "d"):
+            await self.store.write(key, key, sources=self.sources, expected_version=None)
+        with patch.object(self.store, "_read", wraps=self.store._read) as read:
+            page = await self.store.list_entries(limit=2)
+            self.assertEqual([entry.key for entry in page["items"]], ["a", "b"])
+            self.assertEqual(page["next_cursor"], "b")
+            self.assertEqual(read.call_count, 2)
+        page = await self.store.list_entries(limit=2, after="b")
+        self.assertEqual([entry.key for entry in page["items"]], ["c", "d"])
+        self.assertIsNone(page["next_cursor"])
+        for invalid in (0, 101, True):
+            with self.assertRaises(ValueError):
+                await self.store.list_entries(limit=invalid)
+
     async def test_tools_record_actual_content_and_current_user_source(self):
         provider = FakeProvider(
             answer(
@@ -114,6 +129,34 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(entry.version, json.dumps(fresh.read_records()))
         with self.assertRaises(ValueError):
             await load_memory_index(session=fresh, store=self.store)
+
+    async def test_dream_accepts_only_identity_event_before_first_run(self):
+        from dataclasses import asdict
+
+        dream = LocalSession(
+            "identity-only", self.root / "sessions", tenant_id="org", user_id="alice"
+        )
+        await dream.commit("session_created", info=asdict(dream.info))
+        self.assertEqual(dream.revision, 1)
+        self.assertEqual(dream.context_entries(), [])
+        provider = FakeProvider(answer("No durable change"))
+        await run_memory_dream(
+            session=dream,
+            store=self.store,
+            experiences="Authorized experience",
+            sources=self.sources,
+            model=MODEL,
+            stream_fn=provider,
+        )
+        with self.assertRaises(ValueError):
+            await run_memory_dream(
+                session=dream,
+                store=self.store,
+                experiences="repeat",
+                sources=self.sources,
+                model=MODEL,
+                stream_fn=provider,
+            )
 
     async def test_local_dream_is_explicit_and_uses_supplied_sources(self):
         dream = LocalSession("dream", self.root / "sessions", tenant_id="org", user_id="alice")
@@ -316,6 +359,23 @@ class GitMemoryTests(unittest.IsolatedAsyncioTestCase):
             .stdout.decode()
             .strip()
         )
+
+    async def test_git_and_draft_list_entries(self):
+        await self.store.write(
+            "people/alice", "Pricing", sources=self.sources, expected_version=None
+        )
+        page = await self.store.list_entries(limit=1)
+        self.assertEqual([entry.key for entry in page["items"]], ["MEMORY"])
+        self.assertEqual(page["next_cursor"], "MEMORY")
+        following = await self.store.list_entries(limit=1, after=page["next_cursor"])
+        self.assertEqual([entry.key for entry in following["items"]], ["people/alice"])
+        self.assertIsNone(following["next_cursor"])
+        async with self.store.draft() as draft:
+            page = await draft.list_entries(limit=1)
+            self.assertEqual(page["next_cursor"], "MEMORY")
+            self.assertEqual(
+                (await draft.list_entries(after="MEMORY"))["items"][0].key, "people/alice"
+            )
 
     async def test_different_files_merge_same_file_conflicts_and_no_force(self):
         initial = await self.store.read("MEMORY")

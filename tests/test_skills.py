@@ -82,6 +82,18 @@ class SkillTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(hasattr(items[1], "content"))
         self.assertFalse(hasattr(items[1], "references"))
 
+    async def test_describe_isolates_invalid_other_entries(self):
+        broken = self.root / "broken"
+        broken.mkdir()
+        (broken / "SKILL.md").write_text("---\ndescription: [\n---\nBad")
+        with self.assertRaises(ValueError):
+            await self.store.discover()
+        info = await self.store.describe("report")
+        self.assertEqual(info.name, "report")
+        self.assertFalse(hasattr(info, "content"))
+        with self.assertRaises(ValueError):
+            await self.store.describe("broken")
+
     async def test_load_full_instructions_then_reference(self):
         loaded = await self.invoke("load_skill", {"name": "report"})
         self.assertIn(self.instructions, loaded["content"][0]["text"])

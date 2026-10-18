@@ -17,6 +17,7 @@ from .store import (
     MemoryEntry,
     MemorySource,
     MemoryStore,
+    page_keys,
     search_entries,
     validate_key,
 )
@@ -234,6 +235,26 @@ class GitMemoryStore(MemoryStore):
             self._git(directory, "reset", "--hard", latest)
         raise GitMemoryError("Memory publication remained busy; retry from a fresh read")
 
+    async def list_entries(self, *, limit=20, after=None):
+        def list_entries():
+            with self._checkout() as (directory, head):
+                paths = self._git(
+                    directory, "ls-tree", "-r", "--name-only", "-z", head
+                ).stdout.split(b"\0")
+                keys = [
+                    path.decode("utf-8")[:-3]
+                    for path in paths
+                    if path.endswith(b".md")
+                    and not any(part.startswith(b".") for part in path.split(b"/"))
+                ]
+                selected, cursor = page_keys(keys, limit, after)
+                return {
+                    "items": [self._read(directory, head, key) for key in selected],
+                    "next_cursor": cursor,
+                }
+
+        return await settle(asyncio.to_thread(list_entries))
+
     async def write(self, key, content, *, sources, expected_version, operation_id=None):
         validate_key(key)
         if not isinstance(content, str):
@@ -286,6 +307,10 @@ class GitMemoryDraft(MemoryStore):
 
     async def search(self, query, limit=10):
         return search_entries(self.entries.values(), query, limit)
+
+    async def list_entries(self, *, limit=20, after=None):
+        selected, cursor = page_keys(self.entries, limit, after)
+        return {"items": [self.entries[key] for key in selected], "next_cursor": cursor}
 
     async def write(self, key, content, *, sources, expected_version, operation_id=None):
         from .store import check_version

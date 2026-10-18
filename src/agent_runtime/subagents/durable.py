@@ -7,8 +7,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from ..execution import DurableExecutor
+from ..execution import DurableExecutor, ExecutionHost
 from ..sessions import DatabaseSession, SessionError
+from ..storage.coordination import validate_limit
 from ..types import maybe_await
 
 
@@ -34,7 +35,18 @@ class DurableSubagentManager:
     restart interrupted work. Unknown tool effects retain normal recovery rules.
     """
 
-    def __init__(self, parent, *, agent_factories, store=None, holder=None, lease_seconds=30):
+    def __init__(
+        self,
+        parent,
+        *,
+        agent_factories,
+        store=None,
+        holder=None,
+        lease_seconds=30,
+        host=None,
+        max_children=32,
+        max_active_children=8,
+    ):
         if not isinstance(parent.session, DatabaseSession):
             raise ValueError("DurableSubagentManager requires a DatabaseSession parent")
         self.parent = parent
@@ -42,13 +54,26 @@ class DurableSubagentManager:
         if self.store is not parent.session.store:
             raise ValueError("Parent and children must share their canonical store")
         self.agent_factories = dict(agent_factories)
-        self.holder = holder or uuid4().hex
-        self.lease_seconds = lease_seconds
+        self.host = (
+            host
+            or getattr(parent.session, "execution_host", None)
+            or ExecutionHost(
+                self.store,
+                holder=holder,
+                lease_seconds=lease_seconds,
+                max_active_children=max_active_children,
+            )
+        )
+        if self.host.store is not self.store:
+            raise ValueError("Subagents and execution host must share their store")
+        self.holder = self.host.holder
+        self.lease_seconds = self.host.lease_seconds
+        self.max_children = validate_limit(max_children)
+        self._spawn_lock = asyncio.Lock()
         self._children = {}
         self._listeners = []
         self._completion_listeners = []
         self._closed = False
-        self._deliveries = {}
 
     def task_id(self, operation_id):
         return uuid5(NAMESPACE_URL, f"subagent:{self.parent.session.session_id}:{operation_id}").hex
@@ -175,18 +200,37 @@ class DurableSubagentManager:
         return self.get()
 
     async def spawn(self, name, task, *, operation_id):
+        # Only one child level is supported by this bounded host. Children cannot
+        # recursively occupy the same child pool while waiting on grandchildren.
+        if self.parent.session.subagent_creation is not None:
+            raise SessionError("Nested durable subagents are not supported")
+        async with self._spawn_lock:
+            return await self._spawn(name, task, operation_id=operation_id)
+
+    async def _spawn(self, name, task, *, operation_id):
         if self._closed:
             raise RuntimeError("Subagent manager is closed")
         if name not in self.agent_factories:
             raise ValueError(f"Unknown agent configuration: {name}")
+        parent_run_id = self.parent.session.snapshot["run_id"]
+        if not parent_run_id:
+            raise SessionError("A durable child requires a parent run")
         task_id = self.task_id(operation_id)
         command_id = f"subagent-start:{task_id}"
         prior = await self.store.get_command(self._tenant, command_id)
+        if prior is None:
+            count = await self.store.count_run_children(
+                self._tenant,
+                self.parent.session.session_id,
+                parent_run_id,
+            )
+            if count >= self.max_children:
+                raise SessionError("This parent run has reached its durable child limit")
         origin = {
             "parent_session_id": self.parent.session.session_id,
             "operation_id": operation_id,
             "root_run_id": self.parent.session.root_run_id,
-            "parent_run_id": self.parent.session.snapshot["run_id"],
+            "parent_run_id": parent_run_id,
             "name": name,
             "task": task,
         }
@@ -267,9 +311,7 @@ class DurableSubagentManager:
             agent.subscribe(emit)
             return agent
 
-        child.executor = DurableExecutor(
-            self.store, factory, holder=f"{self.holder}:{task_id}", lease_seconds=self.lease_seconds
-        )
+        child.executor = DurableExecutor(self.store, factory, host=self.host, child=True)
         while not self._closed and not child.stopping:
             if explicit_resume:
                 result = await child.executor.resume(
@@ -290,7 +332,7 @@ class DurableSubagentManager:
                 continue
             explicit_resume = False
             if result["status"] in ("completed", "failed", "stopped"):
-                await self._deliver_or_retry(task_id, child.command)
+                await self._deliver(task_id, child.command)
             if result["status"] != "completed":
                 if result.get("error"):
                     child.error = result["error"]
@@ -303,12 +345,20 @@ class DurableSubagentManager:
             command_id = pending[0]["command_id"]
 
     async def _wait_for_owner(self, task_id):
+        # Arm before the PG read. An explicit notification wakes this immediately;
+        # the PG expiry deadline supplies recovery when a notification is lost.
+        event = self.host.change_event(self._tenant, task_id)
         lease = await self.store.get_execution(self._tenant, task_id)
         remaining = (lease.expires_at - datetime.now(timezone.utc)).total_seconds() if lease else 0
-        # Never spin on an expired owner; cap sleeps to observe cancellation/renewal.
-        await asyncio.sleep(min(1.0, max(0.02, remaining)))
+        if remaining > 0:
+            try:
+                await asyncio.wait_for(event.wait(), remaining)
+            except TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(0)
 
-    async def _deliver_or_retry(self, task_id, command):
+    async def _deliver(self, task_id, command):
         if command["state"] not in ("completed", "failed", "stopped"):
             return None
         child = self._children[task_id]
@@ -320,31 +370,9 @@ class DurableSubagentManager:
             raise
         except Exception as error:
             child.notification_error = str(error)
-        key = (task_id, command["command_id"], command["completed_event_id"])
-        if key in self._deliveries or self._closed:
-            return None
-
-        async def retry():
-            delay = 0.05
-            while not self._closed:
-                await asyncio.sleep(delay)
-                try:
-                    await self._notify(task_id, command)
-                    child.notification_error = None
-                    return
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:
-                    child.notification_error = str(error)
-                    delay = min(5.0, delay * 2)
-
-        task = asyncio.create_task(retry())
-        self._deliveries[key] = task
-        task.add_done_callback(
-            lambda finished: (
-                self._deliveries.pop(key, None) if self._deliveries.get(key) is finished else None
-            )
-        )
+        # The notification is already committed with the child's terminal fact.
+        # A central dispatcher reads pending_child_results; there is no per-child
+        # retry task or need to rebuild parent/child sessions to deliver it.
         return None
 
     async def _notify(self, task_id, command):
@@ -372,6 +400,7 @@ class DurableSubagentManager:
             },
         )
         if notification["state"] != "completed":
+            await self.host.announce(self._tenant, self.parent.session.session_id)
             for listener in tuple(self._completion_listeners):
                 await maybe_await(listener(notification))
         return notification
@@ -392,7 +421,7 @@ class DurableSubagentManager:
         for task_id in self._children:
             child = await self._load(task_id)
             for command in await self._commands(task_id):
-                await self._deliver_or_retry(task_id, command)
+                await self._deliver(task_id, command)
             if resume and child.command["state"] in ("accepted", "applied"):
                 if child.session is None or child.session.snapshot["status"] not in (
                     "failed",
@@ -403,10 +432,31 @@ class DurableSubagentManager:
         return self.get()
 
     async def wait(self, task_id, *, timeout=None):
-        child = await self._load(task_id)
-        if child.task is not None and not child.task.done():
-            await asyncio.wait([child.task], timeout=timeout)
-        return await self.aget(task_id)
+        deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
+        while True:
+            event = self.host.change_event(self._tenant, task_id)
+            child = await self._load(task_id)
+            if child.command["state"] not in ("accepted", "applied") and (
+                child.task is None or child.task.done()
+            ):
+                return self.get(task_id)
+            remaining = None if deadline is None else deadline - asyncio.get_running_loop().time()
+            if remaining is not None and remaining <= 0:
+                return self.get(task_id)
+            tasks = [asyncio.create_task(event.wait())]
+            if child.task is not None and not child.task.done():
+                tasks.append(child.task)
+            try:
+                done, _ = await asyncio.wait(
+                    tasks, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                )
+                if not done:
+                    return await self.aget(task_id)
+                if child.task is not None and child.task.done():
+                    return await self.aget(task_id)
+            finally:
+                tasks[0].cancel()
+                await asyncio.gather(tasks[0], return_exceptions=True)
 
     async def send(self, task_id, message, *, follow_up=False):
         """Durably accept a FIFO next prompt; it doesn't mutate an active run."""
@@ -437,7 +487,8 @@ class DurableSubagentManager:
         child = await self._load(task_id)
         command = child.command
         child.stopping = True
-        await self.store.request_cancel(self._tenant, command["command_id"])
+        await self.host.request_cancel(self._tenant, command["command_id"])
+        self.host.notify(self._tenant, task_id)
         if child.executor is not None:
             child.executor.cancel(self._tenant, command["command_id"])
         if child.task is not None and not child.task.done():
@@ -466,7 +517,6 @@ class DurableSubagentManager:
         tasks = [
             c.task for c in self._children.values() if c.task is not None and not c.task.done()
         ]
-        tasks.extend(task for task in self._deliveries.values() if not task.done())
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

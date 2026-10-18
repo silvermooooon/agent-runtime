@@ -1,6 +1,5 @@
-"""Optional DB/S3 components; SQLite needs no extra dependency."""
+"""Optional PostgreSQL and S3 components."""
 
 from .config import ArchiveConfig, DatabaseConfig
-from .sqlite import SQLiteStore
 
-__all__ = ["ArchiveConfig", "DatabaseConfig", "SQLiteStore"]
+__all__ = ["ArchiveConfig", "DatabaseConfig"]

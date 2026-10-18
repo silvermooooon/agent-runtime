@@ -76,6 +76,8 @@ await agent.prompt("写一段项目进展：测试已通过，下一步是代码
 
 第一个参数对象用于 `load_skill`，第二个用于 `load_skill_reference`。加载 Skill 返回完整说明及可用参考项名称。参考项名称由存储后端解释，本地实现使用相对于该 Skill 目录的路径；数据库实现可以使用逻辑名称，例如 `style-guide`。
 
+`LocalSkillStore.describe(name)` 只读取指定 Skill 的名称和 description；宿主逐项调用时可以隔离坏格式项目，不必因为单个 YAML 错误使整个个人目录不可见。它不加载正文或参考内容。
+
 目录发现由外层调用 `await store.discover()`，返回 `SkillInfo(name, description)` 列表，不包含正文或参考内容。本版模型工具只有上述两个，不包含 `skill_search`。示例把目录摘要放入 system prompt；SaaS 宿主可以先筛选，再把候选目录交给模型。`create_skill_tools()` 本身不会扫描或自动注入全部目录。
 
 需要分别装配时，使用 `create_load_skill_tool(store)`、`create_load_skill_reference_tool(store)`。也可以通过已有 `assemble_tools` 的 builtin 分支选择这些 `AgentTool`。

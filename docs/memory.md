@@ -43,7 +43,9 @@ Store 绑定这两个标识，可复用于同一用户的其他 Session；工具
 可以在内容中使用 `[[people/alice]]` 作为导航约定；工具不解析 Markdown、不自动遍历链接。
 搜索采用不区分大小写、所有关键词均需命中的文本匹配，不包含向量或语义检索。
 
-`MemoryStore` 定义异步 `read/search/write/delete`，后续 DB/S3 实现继承它即可。
+`MemoryStore` 定义异步 `read/search/list_entries/write/delete`，后续 DB/S3 实现继承它即可。
+
+管理端可调用 `await store.list_entries(limit=20, after=None)`，返回 `{"items": [MemoryEntry, ...], "next_cursor": str | None}`。按 key 字典序分页，limit 为 1–100；下一页传上一页的 next_cursor，不计算 total。Local 后端枚举文件名后只读取当前页正文，Git 后端列出路径后只读取当前页 blob，Draft 对现有内存快照使用相同顺序。分页不创建模型工具，也不触发写入或 Dream。
 `MemoryEntry` 只包含 key、content、version、sources、updated_at，内容是普通文本。
 `operation_id` 由 Session 的稳定工具操作标识传入，供后端记录或核实；它本身不是幂等保证。
 没有另外增加 Memory 专用的 Agent 状态机、锁、消息总线或会话日志。

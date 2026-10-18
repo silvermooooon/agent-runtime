@@ -1,11 +1,8 @@
-"""Bounded offline acceptance checks for durable SQLite control contracts only."""
+"""PostgreSQL durable execution, recovery and child delivery with an offline model."""
 
 import asyncio
-import sqlite3
-import tempfile
-import unittest
-from importlib.resources import files
-from pathlib import Path
+
+from postgres_fixture import PostgresCase
 
 from agent_runtime import (
     Agent,
@@ -17,7 +14,6 @@ from agent_runtime import (
 )
 from agent_runtime.execution import DurableExecutor
 from agent_runtime.storage.coordination import CommandConflictError, ExecutionLeaseError
-from agent_runtime.storage.sqlite import SQLiteStore
 from agent_runtime.subagents import DurableSubagentManager
 
 MODEL = Model("controlled-offline", "local", "fake", "")
@@ -43,17 +39,9 @@ def factory(session):
     )
 
 
-class DurableSQLiteChecks(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        self.path = Path(self.directory.name) / "runtime.sqlite3"
-        self.store = await SQLiteStore.connect(self.path)
-        self.addAsyncCleanup(self.store.close)
-        await self.store.install_schema()
-
+class DurablePostgresChecks(PostgresCase):
     async def test_idempotent_acceptance_reopen_snapshot_and_fork(self):
-        await self.store.install_schema()
+        await self.store.check_schema()
         executor = DurableExecutor(self.store, factory)
         first = await executor.execute(
             "t", "s", user_id="u", command_id="c", message="hello\x00world"
@@ -70,7 +58,7 @@ class DurableSQLiteChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await session.asnapshot_at(events[-1]["id"]))["status"], "completed")
         branch = await session.fork(events[-1]["id"], session_id="branch")
         self.assertEqual(branch.snapshot["messages"], session.snapshot["messages"])
-        other = await SQLiteStore.connect(self.path)
+        other = await self.open_store()
         try:
             reopened = await DatabaseSession.open(other, tenant_id="t", session_id="s")
             self.assertEqual(reopened.snapshot["status"], "completed")
@@ -206,41 +194,6 @@ class DurableSQLiteChecks(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(next_run["status"], "completed")
 
-    async def test_explicit_additive_v1_migration_preserves_commands(self):
-        legacy_path = Path(self.directory.name) / "legacy.sqlite3"
-        ddl = files("agent_runtime.storage").joinpath("sqlite/001_schema.sql").read_text()
-        ddl = ddl.replace(", parent_session_id TEXT", "").replace("cancel_requested_at TEXT, ", "")
-        ddl = ddl.replace(
-            "CREATE INDEX agent_commands_parent ON "
-            "agent_commands(tenant_id,parent_session_id,session_id,command_seq);",
-            "",
-        )
-        ddl = ddl.replace("PRAGMA user_version=2", "PRAGMA user_version=1")
-        connection = sqlite3.connect(legacy_path)
-        connection.executescript(ddl)
-        connection.execute(
-            "INSERT INTO agent_sessions(tenant_id,session_id,user_id) VALUES('t','legacy','u')"
-        )
-        connection.execute(
-            "INSERT INTO "
-            "agent_commands(tenant_id,command_id,session_id,command_seq,kind,payload,payload_h"
-            "ash,state,accepted_at,updated_at) "
-            "VALUES('t','kept','legacy',1,'child_result','{}','digest','accepted','2026-10-17T"
-            "00:00:00.123+00:00','2026-10-17T00:00:00.123+00:00')"
-        )
-        connection.commit()
-        connection.close()
-        legacy = await SQLiteStore.connect(legacy_path)
-        try:
-            with self.assertRaises(SessionError):
-                await legacy.install_schema()
-            result = await legacy.migrate_schema()
-            self.assertEqual(result["version"], 2)
-            self.assertEqual((await legacy.get_command("t", "kept"))["payload_hash"], "digest")
-            self.assertEqual((await legacy.migrate_schema())["version"], 2)
-        finally:
-            await legacy.close()
-
     async def test_child_recovery_waits_for_crashed_worker_lease_expiry(self):
         await DurableExecutor(self.store, factory).execute(
             "t", "parent", user_id="u", command_id="parent-prompt", message="hello"
@@ -285,7 +238,7 @@ class DurableSQLiteChecks(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ExecutionLeaseError):
             await self.store.assert_execution(old_lease)
 
-    async def test_child_notification_retries_store_and_callback_failure_without_new_request(self):
+    async def test_child_notification_survives_delivery_failure_for_central_dispatch(self):
         await DurableExecutor(self.store, factory).execute(
             "t", "parent", user_id="u", command_id="parent-prompt", message="hello"
         )
@@ -318,11 +271,20 @@ class DurableSQLiteChecks(unittest.IsolatedAsyncioTestCase):
         manager.subscribe_completion(transient_receiver)
         child = await manager.spawn("worker", "work", operation_id="notification-retry")
         await manager.wait(child["task_id"], timeout=2)
+        # Acceptance no longer depends on the callback: the child terminal event
+        # and this parent inbox entry are one PG transaction, even though the
+        # manager's optional delivery attempt above failed.
+        pending = await self.store.pending_child_results(limit=100)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["state"], "accepted")
+        with self.assertRaisesRegex(RuntimeError, "product FIFO"):
+            await transient_receiver(pending[0])
+        await transient_receiver((await self.store.pending_child_results())[0])
         await asyncio.wait_for(delivered.wait(), 2)
         notices = await self.store.list_notifications("t", "parent")
         self.assertEqual(len(notices), 1)
         self.assertEqual(notices[0]["state"], "completed")
-        self.assertEqual(len(acceptance_attempts), 3)
+        self.assertEqual(len(acceptance_attempts), 1)
         self.assertEqual(len(callbacks), 2)
         self.assertEqual(len(await self.store.list_runs("t", session_id=child["task_id"])), 1)
 
@@ -360,7 +322,7 @@ class DurableSQLiteChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.store.get_command("t", "waiting-child"))["state"], "accepted")
         await self.store.assert_execution(lease)
 
-    async def test_child_completion_reconciles_after_notification_gap(self):
+    async def test_child_completion_commits_notification_before_callback(self):
         await DurableExecutor(self.store, factory).execute(
             "t", "parent", user_id="u", command_id="parent-prompt", message="hello"
         )
@@ -376,7 +338,7 @@ class DurableSQLiteChecks(unittest.IsolatedAsyncioTestCase):
         manager._notify = lose_notification
         spawned = await manager.spawn("worker", "child task", operation_id="stable-operation")
         await manager.wait(spawned["task_id"])
-        self.assertEqual(await self.store.list_notifications("t", "parent"), [])
+        self.assertEqual(len(await self.store.pending_child_results()), 1)
         recovered = DurableSubagentManager(
             factory(parent_session), agent_factories={"worker": factory}, store=self.store
         )
@@ -396,4 +358,6 @@ class DurableSQLiteChecks(unittest.IsolatedAsyncioTestCase):
 
 
 if __name__ == "__main__":
+    import unittest
+
     unittest.main()

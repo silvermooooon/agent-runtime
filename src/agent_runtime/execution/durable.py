@@ -13,6 +13,7 @@ from uuid import uuid4
 from ..sessions import DatabaseSession, SessionError, ToolRecoveryRequired
 from ..storage.coordination import CommandConflictError, ExecutionLeaseError, validate_ttl
 from ..types import maybe_await
+from .host import ExecutionHost
 
 
 class DurableExecutor:
@@ -23,11 +24,19 @@ class DurableExecutor:
     different request through that factory. No background scheduler is installed.
     """
 
-    def __init__(self, store, agent_factory, *, holder=None, lease_seconds=30):
+    def __init__(
+        self, store, agent_factory, *, holder=None, lease_seconds=30, host=None, child=False
+    ):
         self.store = store
         self.agent_factory = agent_factory
-        self.holder = holder or uuid4().hex
-        self.lease_seconds = validate_ttl(lease_seconds)
+        self.host = host or ExecutionHost(
+            store, holder=holder or uuid4().hex, lease_seconds=lease_seconds
+        )
+        if self.host.store is not store:
+            raise ValueError("Executor and execution host must share the store")
+        self.holder = self.host.holder
+        self.lease_seconds = validate_ttl(self.host.lease_seconds)
+        self.child = child
         self._active = {}
 
     async def execute(self, tenant_id, session_id, *, user_id, command_id, message):
@@ -116,6 +125,12 @@ class DurableExecutor:
         return session
 
     async def _execute(self, command, *, user_id, explicit_resume=False):
+        async with self.host.slot(child=self.child):
+            return await self._execute_owned(
+                command, user_id=user_id, explicit_resume=explicit_resume
+            )
+
+    async def _execute_owned(self, command, *, user_id, explicit_resume=False):
         tenant, sid = command["tenant_id"], command["session_id"]
         if command["state"] in ("completed", "rejected") or (
             command["state"] in ("failed", "stopped") and not explicit_resume
@@ -135,7 +150,28 @@ class DurableExecutor:
         if lease is None:
             return self._result(command, "busy")
         session = None
-        heartbeat = None
+        work = agent = None
+        heartbeat_error = []
+
+        def abort():
+            if agent is not None:
+                agent.abort()
+
+        def lost(error):
+            heartbeat_error.append(error)
+            abort()
+            if work is not None:
+                work.cancel()
+
+        def renewed(current):
+            nonlocal lease
+            lease = current
+            if session is not None:
+                session.execution_lease = current
+
+        self.host.register(
+            lease, command["command_id"], on_cancel=abort, on_lost=lost, on_renew=renewed
+        )
         try:
             command = await self._command(tenant, sid, command["command_id"])
             session = await self._open(command, user_id, lease)
@@ -206,6 +242,7 @@ class DurableExecutor:
                     "DurableExecutor executes prompt commands only",
                 )
             session.accepted_command = command
+            session.execution_host = self.host
             agent = await maybe_await(self.agent_factory(session))
             if agent.session is not session:
                 raise SessionError("Agent factory must use the supplied DatabaseSession")
@@ -216,28 +253,12 @@ class DurableExecutor:
                     return await agent.resume()
                 return await agent.prompt(command["payload"]["message"])
 
+            if heartbeat_error:
+                agent.abort()
+                raise ExecutionLeaseError(
+                    "Execution ownership lost while opening the agent"
+                ) from heartbeat_error[0]
             work = asyncio.create_task(run())
-            heartbeat_error = []
-
-            async def renew():
-                nonlocal lease
-                while True:
-                    await asyncio.sleep(min(1, self.lease_seconds / 3))
-                    try:
-                        lease = await self.store.renew_execution(
-                            lease, ttl_seconds=self.lease_seconds
-                        )
-                        session.execution_lease = lease
-                        current = await self.store.get_command(tenant, command["command_id"])
-                        if current and current.get("cancel_requested_at"):
-                            agent.abort()
-                    except Exception as error:
-                        heartbeat_error.append(error)
-                        agent.abort()
-                        work.cancel()
-                        return
-
-            heartbeat = asyncio.create_task(renew())
             try:
                 await work
             except asyncio.CancelledError:
@@ -250,6 +271,10 @@ class DurableExecutor:
                     ) from heartbeat_error[0]
                 raise
             except ToolRecoveryRequired as error:
+                if not session._failed and session.snapshot["status"] != "waiting_recovery":
+                    await session.commit(
+                        "run_interrupted", status="waiting_recovery", reason=str(error)
+                    )
                 current = await self._command(tenant, sid, command["command_id"])
                 return self._result(current, "recovery_required", session.snapshot, error)
             except ExecutionLeaseError:
@@ -278,12 +303,12 @@ class DurableExecutor:
             )
         finally:
             self._active.pop((tenant, command["command_id"]), None)
-            if heartbeat is not None:
-                heartbeat.cancel()
-                await asyncio.gather(heartbeat, return_exceptions=True)
+            self.host.unregister(lease)
             # Lease expiration is safe if shutdown prevents a successful release.
             with suppress(Exception):
                 await self.store.release_execution(lease)
+            with suppress(Exception):
+                await self.host.announce(tenant, sid)
 
     @staticmethod
     def _settled_context(messages):
@@ -352,7 +377,7 @@ class DurableExecutor:
 
     async def request_cancel(self, tenant_id, command_id):
         """Persist cross-worker abort intent; active heartbeat observes it."""
-        command = await self.store.request_cancel(tenant_id, command_id)
+        command = await self.host.request_cancel(tenant_id, command_id)
         self.cancel(tenant_id, command_id)
         return None if command is None else self._result(command)
 

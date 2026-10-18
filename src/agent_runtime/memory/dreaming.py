@@ -26,7 +26,7 @@ async def run_memory_dream(
     source_reader(source) must enforce the same user's access to the referenced historical logs.
     """
     store.check_identity(session.info)
-    if session.revision:
+    if session.snapshot.get("run_id") is not None or session.context_entries():
         raise ValueError("Dream attempts require a fresh Session")
     refs = tuple(sources)
     if not refs:

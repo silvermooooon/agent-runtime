@@ -186,6 +186,53 @@ async def coordination_project(conn, session, record):
             "updated_at=clock_timestamp() WHERE tenant_id=%s AND command_id=%s",
             (state, record["seq"], record["id"], tenant, command_id),
         )
+        if state in ("completed", "failed", "stopped") and kind != "history_reset":
+            await _project_child_notification(conn, tenant, sid, command, state, record)
+
+
+async def _project_child_notification(conn, tenant, sid, command, state, record):
+    """Accept the parent result in the child terminal event's transaction.
+
+    The bounded durable host supports one child level. Parent execution never
+    locks children while committing its own journal. Notifications retain output
+    references only, and the application's outbox can deliver them repeatedly.
+    """
+    creation = await (
+        await conn.execute(
+            "SELECT payload FROM agent_commands WHERE tenant_id=%s AND session_id=%s "
+            "AND parent_session_id IS NOT NULL ORDER BY command_seq LIMIT 1",
+            (tenant, sid),
+        )
+    ).fetchone()
+    if creation is None:
+        return
+    origin = creation["payload"]["subagent"]
+    parent_id = origin["parent_session_id"]
+    notification_id = f"subagent-result:{sid}:{command['run_id']}:{record['id']}"
+    payload, digest = canonical_payload(
+        {
+            "parent_session_id": parent_id,
+            "child_session_id": sid,
+            "run_id": command["run_id"],
+            "root_run_id": origin.get("root_run_id"),
+            "source_command_id": command["command_id"],
+            "status": state,
+            "parent_run_id": origin.get("parent_run_id"),
+            "completed_event_id": record["id"],
+        }
+    )
+    await conn.execute(
+        "SELECT session_id FROM agent_sessions WHERE tenant_id=%s AND session_id=%s FOR UPDATE",
+        (tenant, parent_id),
+    )
+    await conn.execute(
+        "INSERT INTO agent_commands "
+        "(tenant_id,command_id,session_id,command_seq,kind,payload,payload_hash) "
+        "SELECT %s,%s,%s,COALESCE(MAX(command_seq),0)+1,'child_result',%s,%s "
+        "FROM agent_commands WHERE tenant_id=%s AND session_id=%s "
+        "ON CONFLICT (tenant_id,command_id) DO NOTHING",
+        (tenant, notification_id, parent_id, Json(payload), digest, tenant, parent_id),
+    )
 
 
 class PostgresStore:
@@ -195,6 +242,9 @@ class PostgresStore:
 
     @classmethod
     async def connect(cls, config, *, archive=None):
+        from psycopg.conninfo import conninfo_to_dict
+
+        connection_options = conninfo_to_dict(config.url).get("options", "")
         pool = AsyncConnectionPool(
             config.url,
             min_size=config.pool_min_size,
@@ -203,7 +253,10 @@ class PostgresStore:
             kwargs={
                 "row_factory": dict_row,
                 "connect_timeout": config.connect_timeout_seconds,
-                "options": f"-c statement_timeout={config.statement_timeout_seconds * 1000}",
+                "options": (
+                    connection_options
+                    + f" -c statement_timeout={config.statement_timeout_seconds * 1000}"
+                ).strip(),
             },
         )
         try:
@@ -224,6 +277,7 @@ class PostgresStore:
                 "002_checkpoints.sql",
                 "003_session_identity.sql",
                 "004_coordination.sql",
+                "005_execution_dispatch.sql",
             ):
                 ddl = files("agent_runtime.storage").joinpath(f"sql/{name}").read_text()
                 await conn.execute(ddl)
@@ -233,6 +287,98 @@ class PostgresStore:
         ddl = files("agent_runtime.storage").joinpath("sql/004_coordination.sql").read_text()
         async with self.pool.connection() as conn:
             await conn.execute(ddl)
+
+    async def upgrade_schema(self):
+        """Explicit deploy-time install/upgrade; connect/check never migrate.
+
+        The deployment must serialize migrations, as with install_schema. Safe to
+        repeat for complete schema versions 001 through 005.
+        """
+        async with self.pool.connection() as conn:
+            state = await (
+                await conn.execute(
+                    "SELECT to_regclass('agent_sessions') AS sessions, "
+                    "to_regclass('agent_session_checkpoints') AS checkpoints, "
+                    "to_regclass('agent_commands') AS commands, "
+                    "EXISTS (SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema=current_schema() AND table_name='agent_sessions' "
+                    "AND column_name='user_id') AS identity"
+                )
+            ).fetchone()
+        if state["sessions"] is None:
+            return await self.install_schema()
+        migrations = []
+        if state["checkpoints"] is None:
+            migrations.append("002_checkpoints.sql")
+        if not state["identity"]:
+            migrations.append("003_session_identity.sql")
+        if state["commands"] is None:
+            migrations.append("004_coordination.sql")
+        migrations.append("005_execution_dispatch.sql")
+        async with self.pool.connection() as conn:
+            for name in migrations:
+                ddl = files("agent_runtime.storage").joinpath(f"sql/{name}").read_text()
+                await conn.execute(ddl)
+        # Existing semantic JSON may contain escaped NUL; do not extract keys
+        # inside PostgreSQL. Explicit deployment backfills in bounded pages.
+        after = None
+        while True:
+            async with self.pool.connection() as conn:
+                cursor = "" if after is None else " WHERE (tenant_id,session_id,seq)>(%s,%s,%s)"
+                rows = await (
+                    await conn.execute(
+                        "SELECT tenant_id,session_id,seq,record FROM agent_session_events"
+                        + cursor
+                        + " ORDER BY tenant_id,session_id,seq LIMIT 1000",
+                        () if after is None else after,
+                    )
+                ).fetchall()
+                if not rows:
+                    break
+                async with conn.cursor() as cur:
+                    await cur.executemany(
+                        "UPDATE agent_session_events SET run_id=%s "
+                        "WHERE tenant_id=%s AND session_id=%s AND seq=%s AND run_id IS NULL",
+                        [
+                            (
+                                row["record"].get("run_id"),
+                                row["tenant_id"],
+                                row["session_id"],
+                                row["seq"],
+                            )
+                            for row in rows
+                        ],
+                    )
+                after = (rows[-1]["tenant_id"], rows[-1]["session_id"], rows[-1]["seq"])
+        after = None
+        while True:
+            async with self.pool.connection() as conn:
+                cursor = "" if after is None else " AND (tenant_id,command_id)>(%s,%s)"
+                rows = await (
+                    await conn.execute(
+                        "SELECT tenant_id,command_id,payload FROM agent_commands "
+                        "WHERE parent_session_id IS NOT NULL AND parent_run_id IS NULL"
+                        + cursor
+                        + " ORDER BY tenant_id,command_id LIMIT 1000",
+                        () if after is None else after,
+                    )
+                ).fetchall()
+                if not rows:
+                    break
+                async with conn.cursor() as cur:
+                    await cur.executemany(
+                        "UPDATE agent_commands SET parent_run_id=%s "
+                        "WHERE tenant_id=%s AND command_id=%s",
+                        [
+                            (
+                                row["payload"].get("subagent", {}).get("parent_run_id"),
+                                row["tenant_id"],
+                                row["command_id"],
+                            )
+                            for row in rows
+                        ],
+                    )
+                after = (rows[-1]["tenant_id"], rows[-1]["command_id"])
 
     async def check_schema(self, *, require_coordination=True):
         """Verify expected structure without installing or changing anything."""
@@ -252,6 +398,7 @@ class PostgresStore:
                 "seq",
                 "event_id",
                 "record",
+                "run_id",
                 "metadata",
             },
             "agent_session_archives": {
@@ -337,6 +484,7 @@ class PostgresStore:
                         "updated_at",
                         "cancel_requested_at",
                         "parent_session_id",
+                        "parent_run_id",
                     },
                     "agent_session_leases": {
                         "tenant_id",
@@ -368,16 +516,12 @@ class PostgresStore:
             raise SessionError(
                 "Runtime schema is missing required structure: "
                 + ", ".join(missing)
-                + ". Apply the explicit SDK SQL scripts through 004_coordination.sql"
-                + (
-                    "."
-                    if require_coordination
-                    else " (001 through 003 suffice for legacy journals)."
-                )
+                + ". Run the explicit SDK upgrade through 005_execution_dispatch.sql"
+                + ("." if require_coordination else " (coordination tables were not checked).")
             )
         return {
             "ready": True,
-            "version": 4 if require_coordination else 3,
+            "version": 5,
             "backend": "postgres",
             "coordination": require_coordination,
         }
@@ -430,14 +574,17 @@ class PostgresStore:
         if run_id is not None:
             validate_identifier(run_id, "run_id")
         normalized, digest = canonical_payload(payload)
-        parent_session_id = None
+        parent_session_id = parent_run_id = None
         subagent = normalized.get("subagent")
         if subagent is not None:
             if not isinstance(subagent, dict):
                 raise ValueError("subagent metadata must be a JSON object")
             parent_session_id = subagent.get("parent_session_id")
+            parent_run_id = subagent.get("parent_run_id")
             if parent_session_id is not None:
                 validate_identifier(parent_session_id, "subagent.parent_session_id")
+            if parent_run_id is not None:
+                validate_identifier(parent_run_id, "subagent.parent_run_id")
         proposed_run_id = run_id or (uuid4().hex if kind == "prompt" else None)
         async with self.pool.connection() as conn:
             await conn.execute(
@@ -494,8 +641,8 @@ class PostgresStore:
                     await conn.execute(
                         "INSERT INTO agent_commands "
                         "(tenant_id,command_id,session_id,command_seq,kind,payload,payload_hash,"
-                        "parent_session_id,run_id) "
-                        "SELECT %s,%s,%s,COALESCE(MAX(command_seq),0)+1,%s,%s,%s,%s,%s "
+                        "parent_session_id,parent_run_id,run_id) "
+                        "SELECT %s,%s,%s,COALESCE(MAX(command_seq),0)+1,%s,%s,%s,%s,%s,%s "
                         "FROM agent_commands WHERE tenant_id=%s AND session_id=%s "
                         "ON CONFLICT (tenant_id,command_id) DO NOTHING RETURNING *",
                         (
@@ -506,6 +653,7 @@ class PostgresStore:
                             Json(normalized),
                             digest,
                             parent_session_id,
+                            parent_run_id,
                             proposed_run_id,
                             tenant_id,
                             session_id,
@@ -634,6 +782,18 @@ class PostgresStore:
                 )
             ).fetchone()
 
+    async def count_run_children(self, tenant_id, parent_session_id, parent_run_id):
+        """Count child creation intents for one parent run, using its lineage index."""
+        async with self.pool.connection() as conn:
+            row = await (
+                await conn.execute(
+                    "SELECT count(*) AS total FROM agent_commands WHERE tenant_id=%s "
+                    "AND parent_session_id=%s AND parent_run_id=%s AND kind='prompt'",
+                    (tenant_id, parent_session_id, parent_run_id),
+                )
+            ).fetchone()
+        return row["total"]
+
     async def request_cancel(self, tenant_id, command_id):
         """Durably request cancellation for the executing worker to observe.
 
@@ -681,6 +841,109 @@ class PostgresStore:
                 )
             ).fetchone()
             return self._lease(row) if row is not None else None
+
+    async def get_commands(self, identities):
+        """Read active control intents in one round trip, never per token."""
+        identities = list(dict.fromkeys(identities))
+        if not identities:
+            return {}
+        placeholders = ",".join(["(%s,%s)"] * len(identities))
+        async with self.pool.connection() as conn:
+            rows = await (
+                await conn.execute(
+                    "SELECT * FROM agent_commands WHERE (tenant_id,command_id) IN ("
+                    + placeholders
+                    + ")",
+                    tuple(value for pair in identities for value in pair),
+                )
+            ).fetchall()
+        return {(row["tenant_id"], row["command_id"]): dict(row) for row in rows}
+
+    async def renew_executions(self, leases, *, ttl_seconds=30):
+        """Renew one host's bounded batch; omit lost/expired generations."""
+        ttl = validate_ttl(ttl_seconds)
+        leases = list(leases)
+        if not leases:
+            return []
+        if any(not isinstance(lease, ExecutionLease) for lease in leases):
+            raise ExecutionLeaseError("A valid ExecutionLease is required")
+        placeholders = ",".join(["(%s,%s,%s,%s::bigint)"] * len(leases))
+        values = tuple(
+            value
+            for lease in leases
+            for value in (lease.tenant_id, lease.session_id, lease.holder, lease.fence)
+        )
+        async with self.pool.connection() as conn:
+            rows = await (
+                await conn.execute(
+                    "UPDATE agent_session_leases AS l SET expires_at=clock_timestamp()+"
+                    "(%s * interval '1 second') FROM (VALUES " + placeholders + ") "
+                    "AS requested(tenant_id,session_id,holder,fence) "
+                    "WHERE l.tenant_id=requested.tenant_id AND l.session_id=requested.session_id "
+                    "AND l.holder=requested.holder AND l.fence=requested.fence "
+                    "AND l.expires_at>clock_timestamp() RETURNING l.*",
+                    (ttl, *values),
+                )
+            ).fetchall()
+        return [self._lease(row) for row in rows]
+
+    async def execution_candidates(self, *, limit=100, after=None):
+        """Paged recovery hints; only acquire_execution grants ownership.
+
+        One central dispatcher reads these, including children whose parent has
+        ended. Unknown-effect runs remain paused; no journal replay is required.
+        """
+        limit = validate_limit(limit)
+        cursor, params = "", []
+        if after is not None:
+            cursor = " AND (c.updated_at,c.tenant_id,c.command_id)>(%s,%s,%s)"
+            params.extend(after)
+        async with self.pool.connection() as conn:
+            rows = await (
+                await conn.execute(
+                    "SELECT c.*,s.user_id,l.expires_at,r.status AS run_status "
+                    "FROM agent_commands c JOIN agent_sessions s USING(tenant_id,session_id) "
+                    "LEFT JOIN agent_session_leases l USING(tenant_id,session_id) "
+                    "LEFT JOIN agent_runs r ON r.tenant_id=c.tenant_id "
+                    "AND r.session_id=c.session_id AND r.run_id=c.run_id "
+                    "WHERE c.kind='prompt' AND c.state IN ('accepted','applied') "
+                    "AND (l.session_id IS NULL OR l.expires_at<=clock_timestamp()) "
+                    "AND (r.status IS NULL OR r.status NOT IN "
+                    "('waiting_recovery','failed','stopped')) "
+                    "AND NOT EXISTS (SELECT 1 FROM agent_commands earlier "
+                    "WHERE earlier.tenant_id=c.tenant_id AND earlier.session_id=c.session_id "
+                    "AND earlier.kind='prompt' AND earlier.state IN ('accepted','applied') "
+                    "AND earlier.command_seq<c.command_seq)"
+                    + cursor
+                    + " ORDER BY c.updated_at,c.tenant_id,c.command_id LIMIT %s",
+                    (*params, limit),
+                )
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def pending_child_results(self, *, limit=100, after=None):
+        """Read a bounded global notification page without opening any sessions.
+
+        A central consumer durably accepts the business continuation, deduping by
+        command_id, and only then calls ack_notification. Delivery can repeat.
+        """
+        limit = validate_limit(limit)
+        cursor, params = "", []
+        if after is not None:
+            cursor = " AND (c.accepted_at,c.tenant_id,c.command_id)>(%s,%s,%s)"
+            params.extend(after)
+        async with self.pool.connection() as conn:
+            rows = await (
+                await conn.execute(
+                    "SELECT c.*,s.user_id FROM agent_commands c "
+                    "JOIN agent_sessions s USING(tenant_id,session_id) "
+                    "WHERE c.kind='child_result' AND c.state='accepted'"
+                    + cursor
+                    + " ORDER BY c.accepted_at,c.tenant_id,c.command_id LIMIT %s",
+                    (*params, limit),
+                )
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     async def acquire_execution(self, tenant_id, session_id, *, holder, ttl_seconds=30):
         """Acquire an expired/unowned session, advancing its fencing generation."""
@@ -778,9 +1041,9 @@ class PostgresStore:
 
     async def _insert_event(self, conn, tenant, sid, record):
         await conn.execute(
-            "INSERT INTO agent_session_events (tenant_id,session_id,seq,event_id,record) "
-            "VALUES (%s,%s,%s,%s,%s)",
-            (tenant, sid, record["seq"], record["id"], Json(record)),
+            "INSERT INTO agent_session_events (tenant_id,session_id,seq,event_id,record,run_id) "
+            "VALUES (%s,%s,%s,%s,%s,%s)",
+            (tenant, sid, record["seq"], record["id"], Json(record), record.get("run_id")),
         )
         if record["type"] == "compaction" and "checkpoint" in record:
             await conn.execute(
@@ -866,10 +1129,38 @@ class PostgresStore:
             return await (await conn.execute(sql, params)).fetchall()
 
     async def read_run_records(self, tenant, sid, run_id, *, after_seq=-1, limit=1000):
-        """Read canonical semantic run records, including any archived prefix."""
+        """Read one run with a SQL cursor/limit and run-scoped archive manifests."""
         validate_limit(limit)
-        records = await self.read_records(tenant, sid, after_seq)
-        return [record for record in records if record.get("run_id") == run_id][:limit]
+        async with self.pool.connection() as conn:
+            await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            archives = await (
+                await conn.execute(
+                    "SELECT * FROM agent_session_archives WHERE tenant_id=%s AND session_id=%s "
+                    "AND end_seq>%s AND (NOT metadata ? 'runs' OR metadata->'runs' ? %s) "
+                    "ORDER BY start_seq",
+                    (tenant, sid, after_seq, run_id),
+                )
+            ).fetchall()
+            hot = await (
+                await conn.execute(
+                    "SELECT record FROM agent_session_events WHERE tenant_id=%s AND session_id=%s "
+                    "AND run_id=%s AND seq>%s ORDER BY seq LIMIT %s",
+                    (tenant, sid, run_id, after_seq, limit),
+                )
+            ).fetchall()
+        records = []
+        for manifest in archives:
+            if self.archive is None:
+                raise SessionError("S3 archive reader is required for this run")
+            records.extend(
+                record
+                for record in await self.archive.get(manifest)
+                if record["seq"] > after_seq and record.get("run_id") == run_id
+            )
+            if len(records) >= limit:
+                return records[:limit]
+        records.extend(row["record"] for row in hot)
+        return records[:limit]
 
     async def read_records(self, tenant, sid, after_seq=-1):
         return await self._read_records(tenant, sid, after_seq=after_seq)
@@ -1006,6 +1297,8 @@ class PostgresStore:
                 records.append(record)
                 size += length
             manifest = await self.archive.put(tenant, sid, records)
+            metadata = dict(manifest.get("metadata") or {})
+            metadata["runs"] = sorted({r["run_id"] for r in records if r.get("run_id")})
             async with self.pool.connection() as conn:
                 current = await (
                     await conn.execute(
@@ -1029,7 +1322,7 @@ class PostgresStore:
                         manifest.get("version_id"),
                         manifest["sha256"],
                         manifest["format_version"],
-                        Jsonb(manifest["metadata"]),
+                        Jsonb(metadata),
                     ),
                 )
                 deleted = await conn.execute(

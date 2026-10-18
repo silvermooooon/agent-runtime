@@ -105,9 +105,23 @@ class MemoryStore(ABC):
     async def search(self, query, limit=10) -> list[dict]: ...
 
     @abstractmethod
+    async def list_entries(self, *, limit=20, after=None) -> dict:
+        """Return {items: [MemoryEntry], next_cursor: key | None} in key order."""
+        ...
+
+    @abstractmethod
     async def write(
         self, key, content, *, sources, expected_version, operation_id=None
     ) -> MemoryEntry: ...
 
     @abstractmethod
     async def delete(self, key, *, expected_version, operation_id=None): ...
+
+
+def page_keys(keys, limit, after):
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("Memory page limit must be between 1 and 100")
+    if after is not None:
+        validate_key(after)
+    selected = sorted(key for key in keys if after is None or key > after)[: limit + 1]
+    return selected[:limit], selected[limit - 1] if len(selected) > limit else None

@@ -15,6 +15,7 @@ from .store import (
     MemorySource,
     MemoryStore,
     check_version,
+    page_keys,
     search_entries,
     validate_key,
 )
@@ -64,6 +65,19 @@ class LocalMemoryStore(MemoryStore):
             return search_entries(entries, query, limit)
 
         return await settle(asyncio.to_thread(search))
+
+    async def list_entries(self, *, limit=20, after=None):
+        def list_entries():
+            keys = [
+                path.relative_to(self.directory).as_posix()[:-5]
+                for path in self.directory.rglob("*.json")
+                if not any(part.startswith(".") for part in path.relative_to(self.directory).parts)
+            ]
+            selected, cursor = page_keys(keys, limit, after)
+            items = [entry for key in selected if (entry := self._read(key)) is not None]
+            return {"items": items, "next_cursor": cursor}
+
+        return await settle(asyncio.to_thread(list_entries))
 
     async def write(self, key, content, *, sources, expected_version, operation_id=None):
         def write():

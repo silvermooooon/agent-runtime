@@ -65,6 +65,16 @@ class LocalSkillStore(SkillStore):
             raise ValueError("Skill description must be text")
         return description.strip()
 
+    async def describe(self, name):
+        """Read one skill metadata record; callers may isolate per-entry failures."""
+
+        def describe():
+            directory = self._skill_directory(name)
+            path = self._file(directory, "SKILL.md")
+            return SkillInfo(name, self._description(path))
+
+        return await asyncio.to_thread(describe)
+
     def _discover(self):
         result = []
         for child in sorted(self.directory.iterdir()):
