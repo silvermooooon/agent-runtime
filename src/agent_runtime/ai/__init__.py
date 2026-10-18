@@ -144,7 +144,7 @@ class Models:
                 )
         except Exception as error:
             output["stopReason"] = "aborted" if signal.aborted else "error"
-            output["errorMessage"] = str(error) or "Operation aborted"
+            output["errorMessage"] = str(error) or type(error).__name__
             named_stream.push({"type": "error", "reason": output["stopReason"], "error": output})
             return stream
         session = options.get("_session")
@@ -220,7 +220,9 @@ class Models:
                     error, (OperationAborted, asyncio.CancelledError)
                 )
                 output["stopReason"] = "aborted" if aborted else "error"
-                output["errorMessage"] = str(error) or "Operation aborted"
+                output["errorMessage"] = str(error) or (
+                    "Operation aborted" if aborted else type(error).__name__
+                )
                 named_stream.push(
                     {"type": "error", "reason": output["stopReason"], "error": output}
                 )

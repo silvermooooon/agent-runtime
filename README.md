@@ -349,3 +349,7 @@ Session 保存和恢复由 Runtime 直接调用，不依赖事件订阅。`messa
 `tenant_id` 和 `user_id`，重开时从日志恢复；LocalSession 可省略身份。Agent 无独立用户参数，
 子 Agent 和分叉默认继承归属。身份不会自动进入模型上下文，认证与授权由业务层负责。
 详见 [会话身份](docs/sessions.md#会话身份)。
+
+## Durable SQLite / PostgreSQL execution
+
+`DatabaseSession` now supports local `SQLiteStore` and the existing deployment `PostgresStore`. The SDK owns durable prompt acceptance, fenced execution/recovery and durable child-result notifications through `DurableExecutor` and `DurableSubagentManager`. Semantic outputs remain canonical; token deltas stay ephemeral. See [durable execution, explicit schema setup and recovery contracts](docs/durable-execution.md).

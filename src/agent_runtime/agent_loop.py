@@ -265,6 +265,8 @@ async def _run_loop(context, new_messages, config, emit, signal, stream_fn, reco
             )
             if hard_exit or (decision or {}).get("action") == "end":
                 if session and not hard_exit:
+                    if hasattr(session, "assert_execution"):
+                        await session.assert_execution(signal)
                     await session.commit("run_completed")
                 await maybe_await(emit({"type": "agent_end", "messages": new_messages}))
                 return
@@ -282,6 +284,8 @@ async def _run_loop(context, new_messages, config, emit, signal, stream_fn, reco
             continue
         break
     if session:
+        if hasattr(session, "assert_execution"):
+            await session.assert_execution(signal)
         await session.commit("run_completed")
     await maybe_await(emit({"type": "agent_end", "messages": new_messages}))
 
@@ -312,9 +316,11 @@ async def _stream_assistant(context, config, emit, signal, stream_fn, prepared_r
     if config.session and not prepared_request:
         await config.session.request(context, config.model, options, llm_messages)
     signal.throw_if_aborted()
+    if config.session and hasattr(config.session, "assert_execution"):
+        await config.session.assert_execution(signal)
     response = await maybe_await(stream_fn(config.model, AgentContext(llm_messages), options))
     try:
-        return await _consume_assistant(response, context, config, emit)
+        return await _consume_assistant(response, context, config, emit, signal)
     except BaseException:
         # A failed sink must not leave a background HTTP producer filling an abandoned queue.
         task = getattr(response, "task", None)
@@ -324,7 +330,7 @@ async def _stream_assistant(context, config, emit, signal, stream_fn, prepared_r
         raise
 
 
-async def _consume_assistant(response, context, config, emit):
+async def _consume_assistant(response, context, config, emit, signal):
     added = False
     async for event in response:
         kind = event["type"]
@@ -351,6 +357,8 @@ async def _consume_assistant(response, context, config, emit):
     final["thinkingLevel"] = config.options.get("reasoning")
     if config.session:
         await config.session.model_finished(final)
+        if hasattr(config.session, "assert_execution"):
+            await config.session.assert_execution(signal)
     if added:
         context.messages[-1] = final
     else:
@@ -583,6 +591,8 @@ async def _run_tools(entries, context, assistant, config, signal, emit):
     session = config.session
 
     async def invoke(call, tool, args):
+        if session and hasattr(session, "assert_execution"):
+            await session.assert_execution(signal)
         result = await _invoke_tool(
             call,
             tool,
@@ -600,6 +610,8 @@ async def _run_tools(entries, context, assistant, config, signal, emit):
                     events.put_nowait(("result", call, args, result))
                 else:
                     if session:
+                        if hasattr(session, "assert_execution"):
+                            await session.assert_execution(signal)
                         await session.tool_started(call, args)
                     group.create_task(invoke(call, tool, args))
             while len(outcomes) < len(entries):

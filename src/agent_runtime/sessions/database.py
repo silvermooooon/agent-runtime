@@ -1,4 +1,4 @@
-"""Optional PostgreSQL session, retaining only the current recovery state."""
+"""Database-backed canonical session, retaining only current recovery state."""
 
 from uuid import uuid4
 
@@ -14,6 +14,8 @@ class DatabaseSession(Session):
         if not tenant_id:
             raise ValueError("tenant_id is required")
         self.store = store
+        self.execution_lease = None
+        self.accepted_command = None
 
     @classmethod
     async def open(cls, store, *, tenant_id, session_id):
@@ -67,6 +69,33 @@ class DatabaseSession(Session):
         )
         return await self.fork_into(event_id, target)
 
+    async def assert_execution(self, signal=None):
+        """Check ownership immediately before a new remote dispatch."""
+        checker = getattr(self.store, "assert_session_execution", None)
+        if checker is not None:
+            await checker(self)
+        if self.accepted_command is not None:
+            command = await self.store.get_command(
+                self.info.tenant_id, self.accepted_command["command_id"]
+            )
+            if command and command.get("cancel_requested_at"):
+                if signal is not None:
+                    signal.abort()
+                    signal.throw_if_aborted()
+                from ..types import OperationAborted
+
+                raise OperationAborted("Durable cancellation requested")
+
+    async def commit(self, kind, **data):
+        if kind == "run_started" and self.accepted_command is not None:
+            command = self.accepted_command
+            data["command_id"] = command["command_id"]
+            if command.get("run_id"):
+                data["run_id"] = command["run_id"]
+                if data.get("source") != "subagent":
+                    data["root_run_id"] = f"{self.session_id}/{command['run_id']}"
+        return await super().commit(kind, **data)
+
     def wrap_stream_fn(self, stream_fn):
         """Record each physical adapter invocation, including recovery and compaction."""
         from ..storage.tracking import tracked_stream
@@ -80,6 +109,7 @@ class DatabaseSession(Session):
             if purpose == "compaction":
                 data.update(messages=context.messages, options=saved_options(options))
             await self.commit("model_call_started", **data)
+            await self.assert_execution(options.get("signal"))
             return await tracked_stream(self, attempt, stream_fn, model, context, options)
 
         return stream

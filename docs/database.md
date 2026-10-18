@@ -1,3 +1,5 @@
+> Update: this page describes the original seven-table journal/archive API. SDK-owned durable commands, execution leases, SQLite, async child factories and result handoff are documented in [durable-execution.md](durable-execution.md); that contract supersedes the historical host-only scheduling statements below.
+
 # PostgreSQL Session、审查与 S3 归档
 
 这是可选组件，不改变 LocalSession 的默认行为，不提供 Worker 所有权或后台归档调度。

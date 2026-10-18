@@ -184,7 +184,7 @@ def reduce_record(state, record):
     elif kind == "subagent_created":
         if state["subagent_creation"] is None:
             state["subagent_creation"] = deepcopy(data)
-    elif kind in ("model_call_started", "model_call_finished"):
+    elif kind in ("model_call_started", "model_call_finished", "command_rejected"):
         pass  # Composition metadata; never enters model context.
     elif kind == "run_started":
         state["has_runs"] = True

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from copy import deepcopy
 from dataclasses import dataclass
 from uuid import NAMESPACE_URL, uuid5
@@ -23,8 +24,9 @@ class _Child:
 class SubagentManager:
     """One manager per parent, on its event loop. Factories must return fresh agents.
 
-    agent_factories maps configuration names to synchronous factory(session) functions.
-    session_factory(id) opens that exact session. Keep configurations stable on recovery.
+    agent_factories maps configuration names to sync or async factory(session) functions.
+    session_factory(id) may be async and opens that exact session. Async factories use
+    await aget() for unloaded children. Keep configurations stable on recovery.
     """
 
     def __init__(self, parent, *, agent_factories, session_factory):
@@ -58,6 +60,10 @@ class SubagentManager:
     def _child(self, task_id):
         if task_id not in self._children:
             session = self.session_factory(task_id)
+            if inspect.isawaitable(session):
+                if inspect.iscoroutine(session):
+                    session.close()
+                raise SessionError("Async session factories require await manager.aget(task_id)")
             session._inherit_identity(self.parent.session.info)
             creation = self._creation(session)
             if not creation or creation["parent_session_id"] != self.parent.session.session_id:
@@ -65,13 +71,46 @@ class SubagentManager:
             self._children[task_id] = _Child(session)
         return self._children[task_id]
 
+    async def _achild(self, task_id):
+        if task_id not in self._children:
+            session = await maybe_await(self.session_factory(task_id))
+            session._inherit_identity(self.parent.session.info)
+            creation = self._creation(session)
+            if not creation or creation["parent_session_id"] != self.parent.session.session_id:
+                raise ValueError(f"Unknown child task: {task_id}")
+            self._children[task_id] = _Child(session)
+        return self._children[task_id]
+
+    async def aget(self, task_id=None):
+        """Async status lookup/recovery discovery; reading never starts execution."""
+        if task_id is not None:
+            await self._achild(task_id)
+            return self.get(task_id)
+        ids = dict.fromkeys(self._children)
+        for suffix in self.parent.session.spawn_operations:
+            operation = f"{self.parent.session.session_id}/{suffix}"
+            key = self.task_id(operation)
+            try:
+                await self._achild(key)
+            except (FileNotFoundError, ValueError):
+                continue
+            ids[key] = None
+        return [self.get(key) for key in ids]
+
     def _known_ids(self):
         ids = dict.fromkeys(self._children)
         # A spawn can have committed its child before the parent saved its tool result.
         for suffix in self.parent.session.spawn_operations:
             operation = f"{self.parent.session.session_id}/{suffix}"
             task_id = self.task_id(operation)
-            if self._creation(self.session_factory(task_id)):
+            factory = self.session_factory
+            if inspect.iscoroutinefunction(factory) or inspect.iscoroutinefunction(
+                getattr(factory, "__call__", None)
+            ):
+                if task_id not in self._children:
+                    raise SessionError("Async session factories require await manager.aget()")
+                ids[task_id] = None
+            elif self._creation(factory(task_id)):
                 ids[task_id] = None
         return ids
 
@@ -83,9 +122,10 @@ class SubagentManager:
         task_id = self.task_id(operation_id)
         if task_id in self._children:
             return self.get(task_id)
-        session = self.session_factory(task_id)
+        session = await maybe_await(self.session_factory(task_id))
         session._inherit_identity(self.parent.session.info)
         if self._creation(session):
+            await self._achild(task_id)
             return self.get(task_id)
         child = _Child(session)
         self._children[task_id] = child
@@ -127,9 +167,9 @@ class SubagentManager:
         child.task = asyncio.create_task(run())
 
     async def _execute(self, task_id, message=None):
-        child = self._child(task_id)
+        child = await self._achild(task_id)
         creation = self._creation(child.session)
-        agent = self.agent_factories[creation["name"]](child.session)
+        agent = await maybe_await(self.agent_factories[creation["name"]](child.session))
         child.agent = agent
 
         async def emit(event, signal):
@@ -179,7 +219,7 @@ class SubagentManager:
         }
 
     async def wait(self, task_id, *, timeout=None):
-        child = self._child(task_id)
+        child = await self._achild(task_id)
         if child.task and not child.task.done():
             # asyncio.wait never cancels the child when this waiter times out or is cancelled.
             await asyncio.wait([child.task], timeout=timeout)
@@ -187,7 +227,7 @@ class SubagentManager:
 
     async def send(self, task_id, message, *, follow_up=False):
         self._check_open()
-        child = self._child(task_id)
+        child = await self._achild(task_id)
         if child.task and not child.task.done():
             if child.agent is None or not child.agent.state.is_streaming:
                 raise RuntimeError("Child is starting or settling; retry after checking status")
@@ -201,14 +241,14 @@ class SubagentManager:
     async def resume(self, task_id):
         """Explicit host recovery; unknown tool outcomes retain existing recovery rules."""
         self._check_open()
-        child = self._child(task_id)
+        child = await self._achild(task_id)
         if not child.task or child.task.done():
             if self.get(task_id)["status"] != "completed":
                 self._launch(child, lambda: self._execute(task_id))
         return self.get(task_id)
 
     async def stop(self, task_id):
-        child = self._child(task_id)
+        child = await self._achild(task_id)
         if child.task and not child.task.done():
             if child.agent:
                 child.agent.abort()

@@ -55,7 +55,7 @@ def create_subagent_tools(manager):
                     **args, operation_id=manager.parent.session.tool_operation_id(call_id)
                 )
             elif name == "get_agent":
-                result = manager.get(**args)
+                result = await manager.aget(**args)
             elif name == "send_agent_message":
                 result = await manager.send(**args)
             elif name == "wait_agent":

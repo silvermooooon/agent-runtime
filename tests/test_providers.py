@@ -81,6 +81,19 @@ def response_events(*, tool=False, text="hello", reasoning=False):
 
 
 class ProviderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_transport_error_is_not_reported_as_abort(self):
+        async def fail(request):
+            raise httpx.ReadTimeout("", request=request)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(fail)) as client:
+            models = Models(client=client)
+            model = models.get_model("openai", "gpt-6-luna")
+            message = await models.complete_simple(
+                model, AgentContext([user_message("hi")]), {"api_key": "test"}
+            )
+        self.assertEqual(message["stopReason"], "error")
+        self.assertEqual(message["errorMessage"], "ReadTimeout")
+
     def test_tool_images_survive_provider_conversion_and_preserve_batch_order(self):
         image = {"type": "image", "mimeType": "image/png", "data": "aW1hZ2U="}
         results = [

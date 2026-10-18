@@ -65,7 +65,7 @@ async def project(conn, session, record):
         # Custom adapters must explicitly mark a complete, provider-reported usage result.
         known = message.get("usageStatus") == "known"
         keys = ("input", "output", "cacheRead", "cacheWrite", "totalTokens")
-        if known and any(not isinstance(usage.get(k), int) or usage[k] < 0 for k in keys):
+        if known and any(type(usage.get(k)) is not int or usage[k] < 0 for k in keys):
             known = False
         await conn.execute(
             """UPDATE agent_model_usage SET finished_at=%s,status=%s,
