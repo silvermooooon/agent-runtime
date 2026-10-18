@@ -45,11 +45,17 @@ to continue the work. Use this format:
 ## Next Steps
 ## Critical Context
 Keep each section concise. Preserve exact file paths, function names, and error messages.
+Preserve the active goal, outstanding questions and decisions, completed actions and their results,
+and explicit user authorizations or restrictions needed to continue safely without repeating work.
+Distinguish pending requests from completed actions.
+Do not infer an answer or approval from silence.
 If a previous summary is provided, update it with the new messages: preserve relevant existing
 information, add progress and decisions, and update next steps. Do not continue the conversation."""
 
 PREFIX_PROMPT = """Summarize the early part of an ongoing user request. Later messages are
 retained separately. Use: ## Original Request, ## Progress So Far, ## Context Needed to Continue.
+Preserve outstanding questions, completed actions and results, and explicit authorizations or
+restrictions relevant to continuation. Do not infer an answer or approval from silence.
 Only summarize information present here; do not infer or reconstruct later messages."""
 
 
