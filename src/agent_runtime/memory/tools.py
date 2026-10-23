@@ -72,7 +72,8 @@ def create_memory_tools(
             (
                 "memory_write",
                 "Save durable facts or preferences, not temporary plans. Read before updating. "
-                "On conflict read and reconcile; never blindly overwrite. Keep MEMORY short.",
+                "On conflict read and reconcile; never blindly overwrite. Keep MEMORY short. "
+                "Source references are attached automatically; do not repeat their IDs in prose.",
                 {"key": key, "content": {"type": "string"}, "expected_version": version},
             ),
             (
