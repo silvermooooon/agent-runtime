@@ -46,6 +46,7 @@ class DurableSubagentManager:
         host=None,
         max_children=32,
         max_active_children=8,
+        max_depth=3,
     ):
         if not isinstance(parent.session, DatabaseSession):
             raise ValueError("DurableSubagentManager requires a DatabaseSession parent")
@@ -69,6 +70,7 @@ class DurableSubagentManager:
         self.holder = self.host.holder
         self.lease_seconds = self.host.lease_seconds
         self.max_children = validate_limit(max_children)
+        self.max_depth = validate_limit(max_depth)
         self._spawn_lock = asyncio.Lock()
         self._children = {}
         self._listeners = []
@@ -164,6 +166,11 @@ class DurableSubagentManager:
             if child.stopping and child.command["state"] in ("accepted", "applied")
             else "running"
             if active
+            and state
+            and state.get("run_id") == child.command["run_id"]
+            and state.get("status") == "running"
+            else "queued"
+            if active and not child.error
             else (
                 "completed"
                 if child.command["state"] == "completed"
@@ -200,10 +207,6 @@ class DurableSubagentManager:
         return self.get()
 
     async def spawn(self, name, task, *, operation_id):
-        # Only one child level is supported by this bounded host. Children cannot
-        # recursively occupy the same child pool while waiting on grandchildren.
-        if self.parent.session.subagent_creation is not None:
-            raise SessionError("Nested durable subagents are not supported")
         async with self._spawn_lock:
             return await self._spawn(name, task, operation_id=operation_id)
 
@@ -219,6 +222,11 @@ class DurableSubagentManager:
         command_id = f"subagent-start:{task_id}"
         prior = await self.store.get_command(self._tenant, command_id)
         if prior is None:
+            creation = self.parent.session.subagent_creation
+            parent_depth = validate_limit(creation.get("depth", 1)) if creation is not None else 0
+            depth = parent_depth + 1
+            if depth > self.max_depth:
+                raise SessionError("This durable child would exceed the maximum subagent depth")
             count = await self.store.count_run_children(
                 self._tenant,
                 self.parent.session.session_id,
@@ -234,6 +242,12 @@ class DurableSubagentManager:
             "name": name,
             "task": task,
         }
+        # Replays preserve legacy metadata (which had no depth), and are not
+        # newly admitted work when the host lowers its limits after acceptance.
+        if prior is None:
+            origin["depth"] = depth
+        elif "depth" in prior["payload"]["subagent"]:
+            origin["depth"] = prior["payload"]["subagent"]["depth"]
         command = await self.store.accept_command(
             self._tenant,
             task_id,
@@ -245,12 +259,10 @@ class DurableSubagentManager:
         if task_id not in self._children:
             self._children[task_id] = _DurableChild(command, origin)
         if prior is None:
-            ready = asyncio.Event()
-            self._launch(task_id, command_id, ready=ready)
-            await ready.wait()
+            self._launch(task_id, command_id)
         return await self.aget(task_id)
 
-    def _launch(self, task_id, command_id, *, ready=None, explicit_resume=False):
+    def _launch(self, task_id, command_id, *, explicit_resume=False):
         child = self._children[task_id]
         if child.task is not None and not child.task.done():
             return
@@ -259,14 +271,11 @@ class DurableSubagentManager:
 
         async def run():
             try:
-                await self._drive(task_id, command_id, ready=ready, explicit_resume=explicit_resume)
+                await self._drive(task_id, command_id, explicit_resume=explicit_resume)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 child.error = str(error)
-            finally:
-                if ready is not None:
-                    ready.set()
 
         child.task = asyncio.create_task(run())
         child.task.add_done_callback(lambda _: asyncio.create_task(self._continue_queued(task_id)))
@@ -285,7 +294,7 @@ class DurableSubagentManager:
         if pending and not self._closed:
             self._launch(task_id, pending[0]["command_id"])
 
-    async def _drive(self, task_id, command_id, *, ready=None, explicit_resume=False):
+    async def _drive(self, task_id, command_id, *, explicit_resume=False):
         child = self._children[task_id]
         origin = child.origin
 
@@ -300,8 +309,6 @@ class DurableSubagentManager:
                     for k in ("parent_session_id", "operation_id", "name")
                 ):
                     raise SessionError("Stored child ancestry/configuration does not match")
-            if ready is not None:
-                ready.set()
             agent = await maybe_await(self.agent_factories[origin["name"]](session))
 
             async def emit(event, signal):
@@ -313,6 +320,7 @@ class DurableSubagentManager:
 
         child.executor = DurableExecutor(self.store, factory, host=self.host, child=True)
         while not self._closed and not child.stopping:
+            child.command = await self.store.get_command(self._tenant, command_id)
             if explicit_resume:
                 result = await child.executor.resume(
                     self._tenant, task_id, user_id=self._user, command_id=command_id
@@ -322,8 +330,6 @@ class DurableSubagentManager:
                     self._tenant, task_id, user_id=self._user, command_id=command_id
                 )
             child.command = await self.store.get_command(self._tenant, command_id)
-            if ready is not None:
-                ready.set()
             if result["status"] == "busy":
                 # A previous worker may still own an unexpired lease after a crash.
                 # Stay attached to this accepted child until claim/terminal/stop.
@@ -489,9 +495,14 @@ class DurableSubagentManager:
         child.stopping = True
         await self.host.request_cancel(self._tenant, command["command_id"])
         self.host.notify(self._tenant, task_id)
-        if child.executor is not None:
-            child.executor.cancel(self._tenant, command["command_id"])
+        cancelled = child.executor is not None and child.executor.cancel(
+            self._tenant, command["command_id"]
+        )
         if child.task is not None and not child.task.done():
+            if not cancelled:
+                # A queued driver/factory has no Agent to observe cooperative
+                # cancellation and must not wait for a saturated child pool.
+                child.task.cancel()
             await asyncio.gather(child.task, return_exceptions=True)
         executor = child.executor or DurableExecutor(
             self.store, lambda session: None, holder=self.holder, lease_seconds=self.lease_seconds

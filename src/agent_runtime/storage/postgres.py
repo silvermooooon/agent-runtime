@@ -783,11 +783,12 @@ class PostgresStore:
             ).fetchone()
 
     async def count_run_children(self, tenant_id, parent_session_id, parent_run_id):
-        """Count child creation intents for one parent run, using its lineage index."""
+        """Count distinct children for one parent run, using its lineage index."""
         async with self.pool.connection() as conn:
             row = await (
                 await conn.execute(
-                    "SELECT count(*) AS total FROM agent_commands WHERE tenant_id=%s "
+                    "SELECT count(DISTINCT session_id) AS total FROM agent_commands "
+                    "WHERE tenant_id=%s "
                     "AND parent_session_id=%s AND parent_run_id=%s AND kind='prompt'",
                     (tenant_id, parent_session_id, parent_run_id),
                 )

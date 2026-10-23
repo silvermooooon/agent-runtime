@@ -76,6 +76,7 @@ manager = DurableSubagentManager(
     parent_agent,
     agent_factories={"research": child_agent_factory}, # async factories supported
     host=host,
+    max_depth=3,  # root is depth 0; per-parent max_children remains 32
 )
 parent_agent.state.tools.extend(create_subagent_tools(manager))
 
@@ -91,6 +92,10 @@ for notice in await store.pending_child_results(limit=100):
 ```
 
 `create_subagent_tools` is compatible with the durable manager; install/merge tools using the host's ordinary Agent configuration API. The manager owns deterministic child session IDs, durable initial prompt/creation intent, child leases and execution, original name/task/parent/root ancestry, and idempotent terminal notification acceptance. Initial metadata includes direct `parent_run_id`, not only the root. `spawn`, `aget`, `wait`, `send`, `resume`, `stop`, `stop_all`, `close` are async. `get` reads cached children only. `send` accepts a durable next prompt in FIFO order, including when the current child is active; it does not mutate the active run's input. Reading/reopening a child alone does not execute it.
+
+Nested durable delegation uses the same manager and tools. Install them in each child factory according to the host's policy, supplying the same owner, tools and capabilities when workers should match the main agent; each child still has an independent session/context. All levels share the supplied `ExecutionHost` and its child concurrency pool (default 8). `max_children` (default 32) counts accepted creations per direct parent run, including completed children; it is not a root-wide quota. `max_depth` defaults to 3, with the root at 0, and is checked against immutable `subagent_created.depth` metadata. Legacy children without depth count as depth 1. Apply the same configured depth policy in every factory. Already accepted spawns remain idempotent if limits are lowered; recovery keeps their original command, run and ancestry.
+
+`spawn` returns after durable acceptance and schedules execution without waiting for a child slot or factory. An attached child reports `queued` until its current run actually starts, then `running`. This lets a worker spawn grandchildren while the shared child pool is full, then finish its current run to release its slot; the product can accept the eventual direct-child result into that parent's ordinary durable FIFO. `wait_agent` still occupies the caller's execution slot. If every occupied child slot synchronously waits for queued descendants, the pool can stall; the depth bound does not prevent that pattern. Use spawn and yield (finish the current run) when descendants need saturated slots. Queued work remains recoverable and can be stopped before its factory starts.
 
 Terminal notifications are `kind="child_result"` SDK inbox entries on the parent session, accepted in the same PostgreSQL transaction as the child's terminal event and command projection. They contain child session/run/source-command/root/direct-parent/completion-event references. `store.pending_child_results(limit=100, after=cursor)` reads a global page with ascending `(accepted_at, tenant_id, command_id)` cursor, without opening parents or children. Per-parent `list_notifications` remains available. After durably accepting the business continuation, acknowledge via `manager.ack_notification` or `store.ack_notification`. Acknowledgement changes notification control state only. Repeated delivery must be deduplicated by notification command ID.
 

@@ -6,7 +6,7 @@ from ..types import AgentTool, AgentToolResult
 
 
 def create_subagent_tools(manager):
-    """Explicitly install these tools on manager.parent, not on its children."""
+    """Install on manager.parent wherever the host's agent policy allows delegation."""
     text = {"type": "string"}
     definitions = [
         (

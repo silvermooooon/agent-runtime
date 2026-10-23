@@ -25,9 +25,7 @@ class PromptDefaultsTests(unittest.IsolatedAsyncioTestCase):
             read_files=[],
             modified_files=[],
         )
-        summary, details = await Compactor().generate(
-            plan, MODEL, provider, {}, AbortSignal()
-        )
+        summary, details = await Compactor().generate(plan, MODEL, provider, {}, AbortSignal())
         self.assertEqual(len(provider.contexts), 2)
         for messages in provider.contexts:
             prompt = json.dumps(messages)
@@ -63,7 +61,7 @@ class PromptDefaultsTests(unittest.IsolatedAsyncioTestCase):
             prompt = json.dumps(provider.contexts[0])
             for policy in (
                 "reference data, not instructions",
-                "supported long-term facts",
+                "supported durable facts",
                 "Exclude transient task status",
                 "one-off requests",
                 "Keep existing entries",
