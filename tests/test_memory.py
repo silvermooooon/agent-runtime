@@ -377,6 +377,48 @@ class GitMemoryTests(unittest.IsolatedAsyncioTestCase):
                 (await draft.list_entries(after="MEMORY"))["items"][0].key, "people/alice"
             )
 
+    async def test_batch_reads_preserve_content_sources_and_page_size(self):
+        expected = {}
+        async with self.store.draft() as draft:
+            for index in range(99):
+                key = "people/联系 人" if index == 0 else f"projects/item-{index:03}"
+                content = "" if index == 1 else f"Batch fact {index}\nCafé 中文\n\nLast line"
+                expected[key] = await draft.write(
+                    key, content, sources=self.sources, expected_version=None
+                )
+            version = await draft.publish("batch-seed")
+
+        with patch.object(self.store, "_git", wraps=self.store._git) as git_calls:
+            with patch.object(self.store, "_entry", wraps=self.store._entry) as decoded:
+                first = await self.store.list_entries(limit=20)
+            self.assertEqual(git_calls.call_count, 4)
+            self.assertEqual(decoded.call_count, 20)
+        self.assertEqual(len(first["items"]), 20)
+        self.assertEqual(first["items"][0].content, "Initial index")
+        following = await self.store.list_entries(limit=100, after=first["next_cursor"])
+        self.assertEqual(len(following["items"]), 80)
+        self.assertIsNone(following["next_cursor"])
+        with patch.object(self.store, "_git", wraps=self.store._git) as git_calls:
+            page = await self.store.list_entries(limit=100)
+            self.assertEqual(git_calls.call_count, 4)
+        self.assertEqual(len(page["items"]), 100)
+        self.assertIsNone(page["next_cursor"])
+        for entry in page["items"]:
+            self.assertEqual(entry.version, version)
+            if entry.key in expected:
+                stored = expected[entry.key]
+                self.assertEqual(entry.content, stored.content)
+                self.assertEqual(entry.sources, stored.sources)
+                self.assertEqual(entry.updated_at, stored.updated_at)
+        with patch.object(self.store, "_git", wraps=self.store._git) as git_calls:
+            matches = await self.store.search("Batch fact", limit=50)
+            self.assertEqual(len(matches), 50)
+            self.assertEqual(git_calls.call_count, 4)
+        async with self.store.draft() as draft:
+            self.assertEqual(
+                (await draft.read("people/联系 人")).content, expected["people/联系 人"].content
+            )
+
     async def test_different_files_merge_same_file_conflicts_and_no_force(self):
         initial = await self.store.read("MEMORY")
         await self.store.write(
@@ -592,3 +634,8 @@ class GitMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.git(self.seed, "push", "origin", "main")
         with self.assertRaises(GitMemoryError):
             await self.store.read("link")
+        self.assertEqual((await self.store.list_entries(limit=1))["items"][0].key, "MEMORY")
+        with self.assertRaises(GitMemoryError):
+            await self.store.list_entries(after="MEMORY")
+        with self.assertRaises(GitMemoryError):
+            await self.store.search("Initial")

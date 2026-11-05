@@ -1,6 +1,7 @@
 """Optional Git CLI backend. Each operation uses an isolated clone; never force-pushes."""
 
 import asyncio
+import io
 import json
 import os
 import re
@@ -44,7 +45,7 @@ class GitMemoryStore(MemoryStore):
         self.remote, self.branch = str(remote), branch
         self.timeout, self.publish_attempts = timeout, publish_attempts
 
-    def _git(self, directory, *args, check=True):
+    def _git(self, directory, *args, check=True, input_bytes=None):
         # No shell, no model-controlled remote, and no repository hooks on commits.
         try:
             result = subprocess.run(
@@ -66,6 +67,7 @@ class GitMemoryStore(MemoryStore):
                 cwd=directory,
                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
                 capture_output=True,
+                input=input_bytes,
                 timeout=self.timeout,
             )
         except subprocess.TimeoutExpired:
@@ -121,7 +123,12 @@ class GitMemoryStore(MemoryStore):
         blob = self._blob(directory, revision, key)
         if blob is None:
             return None
-        text = self._git(directory, "cat-file", "blob", blob).stdout.decode("utf-8")
+        content = self._git(directory, "cat-file", "blob", blob).stdout
+        return self._entry(key, content, revision)
+
+    @staticmethod
+    def _entry(key, content, revision):
+        text = content.decode("utf-8")
         sources, updated_at = (), None
         if text.startswith(HEADER):
             first, _, text = text.partition("\n")
@@ -132,17 +139,42 @@ class GitMemoryStore(MemoryStore):
             updated_at = data["updated_at"]
         return MemoryEntry(key, text, revision, sources, updated_at)
 
-    def _entries(self, directory, revision):
-        paths = self._git(directory, "ls-tree", "-r", "--name-only", "-z", revision).stdout.split(
-            b"\0"
-        )
+    def _tree(self, directory, revision):
+        records = self._git(directory, "ls-tree", "-r", "-z", revision).stdout.split(b"\0")
         return {
-            key: self._read(directory, revision, key)
-            for path in paths
-            if path.endswith(b".md")
-            for key in [path.decode("utf-8")[:-3]]
-            if not any(p.startswith(".") for p in key.split("/"))
+            path.decode("utf-8")[:-3]: metadata.split()
+            for record in records
+            if record
+            for metadata, path in [record.split(b"\t", 1)]
+            if path.endswith(b".md") and not any(part.startswith(b".") for part in path.split(b"/"))
         }
+
+    def _read_many(self, directory, revision, tree):
+        if not tree:
+            return {}
+        for key, (mode, kind, _) in tree.items():
+            validate_key(key)
+            if mode not in (b"100644", b"100755") or kind != b"blob":
+                raise GitMemoryError("Memory must be a regular text file")
+        content = io.BytesIO(
+            self._git(
+                directory,
+                "cat-file",
+                "--batch",
+                input_bytes=b"".join(oid + b"\n" for _, _, oid in tree.values()),
+            ).stdout
+        )
+        entries = {}
+        for key in tree:
+            header = content.readline().split()
+            if len(header) != 3 or header[1] != b"blob":
+                raise GitMemoryError("Memory must be a regular text file")
+            entries[key] = self._entry(key, content.read(int(header[2])), revision)
+            content.read(1)  # Git's batch delimiter is separate from the blob body.
+        return entries
+
+    def _entries(self, directory, revision):
+        return self._read_many(directory, revision, self._tree(directory, revision))
 
     async def read(self, key):
         def read():
@@ -238,18 +270,11 @@ class GitMemoryStore(MemoryStore):
     async def list_entries(self, *, limit=20, after=None):
         def list_entries():
             with self._checkout() as (directory, head):
-                paths = self._git(
-                    directory, "ls-tree", "-r", "--name-only", "-z", head
-                ).stdout.split(b"\0")
-                keys = [
-                    path.decode("utf-8")[:-3]
-                    for path in paths
-                    if path.endswith(b".md")
-                    and not any(part.startswith(b".") for part in path.split(b"/"))
-                ]
-                selected, cursor = page_keys(keys, limit, after)
+                tree = self._tree(directory, head)
+                selected, cursor = page_keys(tree, limit, after)
+                entries = self._read_many(directory, head, {key: tree[key] for key in selected})
                 return {
-                    "items": [self._read(directory, head, key) for key in selected],
+                    "items": list(entries.values()),
                     "next_cursor": cursor,
                 }
 
